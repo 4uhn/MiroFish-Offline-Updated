@@ -1,6 +1,4 @@
-"""
-数据模型模块
-"""
+"""Data models."""
 
 from .task import TaskManager, TaskStatus
 from .project import Project, ProjectStatus, ProjectManager

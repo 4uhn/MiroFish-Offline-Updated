@@ -910,7 +910,7 @@ class ReportAgent:
         self.simulation_id = simulation_id
         self.simulation_requirement = simulation_requirement
 
-        self.llm = llm_client or LLMClient()
+        self.llm = llm_client or LLMClient(num_ctx=8192)
         if graph_tools is None:
             raise ValueError(
                 "graph_tools (GraphToolsService) is required. "
@@ -977,8 +977,14 @@ class ReportAgent:
         Returns:
             Tool execution result (text format)
         """
+        # Normalize degenerate param_name/param_value format from LLM
+        if "param_name" in parameters and "param_value" in parameters:
+            real_key = parameters.pop("param_name")
+            real_val = parameters.pop("param_value")
+            parameters[real_key] = real_val
+
         logger.info(f"Executing tool: {tool_name}, parameters: {parameters}")
-        
+
         try:
             if tool_name == "insight_forge":
                 query = parameters.get("query", "")

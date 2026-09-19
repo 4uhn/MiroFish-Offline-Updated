@@ -4,93 +4,128 @@
 
 # MiroFish-Offline
 
-**Fully local fork of [MiroFish](https://github.com/666ghj/MiroFish) — no cloud APIs required. English UI.**
+**Fully local multi-agent simulation engine — no cloud APIs required.**
 
-*A multi-agent swarm intelligence engine that simulates public opinion, market sentiment, and social dynamics. Entirely on your hardware.*
+*Simulate public opinion, market sentiment, and social dynamics entirely on your hardware.*
 
-[![GitHub Stars](https://img.shields.io/github/stars/nikmcfly/MiroFish-Offline?style=flat-square&color=DAA520)](https://github.com/nikmcfly/MiroFish-Offline/stargazers)
-[![GitHub Forks](https://img.shields.io/github/forks/nikmcfly/MiroFish-Offline?style=flat-square)](https://github.com/nikmcfly/MiroFish-Offline/network)
-[![Docker](https://img.shields.io/badge/Docker-Build-2496ED?style=flat-square&logo=docker&logoColor=white)](https://hub.docker.com/)
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue?style=flat-square)](./LICENSE)
 
 </div>
 
 ## What is this?
 
-MiroFish is a multi-agent simulation engine: upload any document (press release, policy draft, financial report), and it generates hundreds of AI agents with unique personalities that simulate the public reaction on social media. Posts, arguments, opinion shifts — hour by hour.
+MiroFish is a multi-agent simulation engine: upload any document (press release, policy draft, financial report), and it generates AI agents with unique personalities that simulate the public reaction on social media. Posts, arguments, opinion shifts — hour by hour.
 
-The [original MiroFish](https://github.com/666ghj/MiroFish) was built for the Chinese market (Chinese UI, Zep Cloud for knowledge graphs, DashScope API). This fork makes it **fully local and fully English**:
+This fork makes it **fully local and fully English**, optimized for Apple Silicon (M2 Pro 16GB tested):
 
-| Original MiroFish | MiroFish-Offline |
-|---|---|
-| Chinese UI | **English UI** (1,000+ strings translated) |
-| Zep Cloud (graph memory) | **Neo4j Community Edition 5.15** |
-| DashScope / OpenAI API (LLM) | **Ollama** (qwen2.5, llama3, etc.) |
-| Zep Cloud embeddings | **nomic-embed-text** via Ollama |
-| Cloud API keys required | **Zero cloud dependencies** |
+| Feature | Original MiroFish | MiroFish-Offline |
+|---|---|---|
+| Language | Chinese UI | **English UI** (1,000+ strings translated) |
+| Graph DB | Zep Cloud | **Neo4j CE 5.18** |
+| LLM | DashScope / OpenAI API | **Ollama** (qwen3:8b) |
+| Embeddings | Zep Cloud | **nomic-embed-text** via Ollama |
+| Cloud dependency | API keys required | **Zero** |
+| Action routing | Every action = LLM call | **System One** (60-70% skip LLM) |
+| Agent behavior | Uniform | **4 archetypes** (Lurker, Amplifier, Contributor, Debater) |
+| Agent memory | Stateless | **Action journal** with SQLite persistence |
+| Response sharing | None | **TopoSim-inspired** archetype pooling |
 
-## Workflow
+## How it works
 
-1. **Graph Build** — Extracts entities (people, companies, events) and relationships from your document. Builds a knowledge graph with individual and group memory via Neo4j.
-2. **Env Setup** — Generates hundreds of agent personas, each with unique personality, opinion bias, reaction speed, influence level, and memory of past events.
-3. **Simulation** — Agents interact on simulated social platforms: posting, replying, arguing, shifting opinions. The system tracks sentiment evolution, topic propagation, and influence dynamics in real time.
-4. **Report** — A ReportAgent analyzes the post-simulation environment, interviews a focus group of agents, searches the knowledge graph for evidence, and generates a structured analysis.
-5. **Interaction** — Chat with any agent from the simulated world. Ask them why they posted what they posted. Full memory and personality persists.
+1. **Graph Build** — Extracts entities (people, companies, events) and relationships from your document. Builds a knowledge graph via Neo4j with chunked sampling for large documents.
+2. **Ontology Generation** — LLM designs entity types and relationship schemas from your source material (10 entity types, 6-10 relationship types).
+3. **Env Setup** — Generates agent personas with behavioral archetypes, speech profiles, emotional states, and weighted action distributions.
+4. **Simulation** — Agents interact on simulated Twitter/Reddit platforms. The **System One router** handles non-text actions (likes, follows, reposts) instantly without LLM calls. Only text-generating actions (posts, comments, quotes) use the LLM. The **response pool** reuses adapted posts between similar agents for further LLM savings.
+5. **Report** — A ReportAgent analyzes the post-simulation environment, interviews agents, searches the knowledge graph, and generates a structured analysis.
+6. **Interaction** — Chat with any agent from the simulated world. Full memory and personality persists.
 
-## Screenshot
+## Architecture
 
-<div align="center">
-<img src="./static/image/mirofish-offline-screenshot.jpg" alt="MiroFish Offline — English UI" width="100%"/>
-</div>
+```
+┌─────────────────────────────────────────────────┐
+│                  Flask API                       │
+│     graph.py   simulation.py   report.py        │
+└──────────────────┬──────────────────────────────┘
+                   │
+┌──────────────────▼──────────────────────────────┐
+│              Service Layer                       │
+│  EntityReader   GraphTools   OntologyGenerator   │
+│  ReportAgent    SimulationConfigGenerator        │
+└──────────────────┬──────────────────────────────┘
+                   │
+┌──────────────────▼──────────────────────────────┐
+│          Simulation Engine (OASIS)               │
+│  ┌─────────────────────────────────────┐        │
+│  │  System One Router                   │        │
+│  │  ┌───────────┐  ┌────────────────┐  │        │
+│  │  │ Archetype  │  │ Response Pool  │  │        │
+│  │  │ Weights    │  │ (text reuse)   │  │        │
+│  │  └─────┬─────┘  └───────┬────────┘  │        │
+│  │        │                │            │        │
+│  │   ManualAction     ManualAction      │        │
+│  │   (instant)        (from pool)       │        │
+│  │        │                │            │        │
+│  │        └────────┬───────┘            │        │
+│  │                 │                    │        │
+│  │            LLMAction                 │        │
+│  │            (Ollama)                  │        │
+│  └─────────────────────────────────────┘        │
+│  Agent Memory Store (SQLite)                     │
+└──────────────────┬──────────────────────────────┘
+                   │
+            ┌──────▼──────┐
+            │  Neo4j CE   │
+            │  5.18       │
+            └─────────────┘
+```
 
 ## Quick Start
 
 ### Prerequisites
 
 - Docker & Docker Compose (recommended), **or**
-- Python 3.11+, Node.js 18+, Neo4j 5.15+, Ollama
+- Python 3.11+, Node.js 18+, Neo4j 5.18+, Ollama
 
-### Option A: Docker (easiest)
+### Option A: Docker
 
 ```bash
-git clone https://github.com/nikmcfly/MiroFish-Offline.git
+git clone https://github.com/44jch/MiroFish-Offline.git
 cd MiroFish-Offline
 cp .env.example .env
 
-# Start all services (Neo4j, Ollama, MiroFish)
 docker compose up -d
 
-# Pull the required models into Ollama
-docker exec mirofish-ollama ollama pull qwen2.5:32b
+# Pull models into Ollama
+docker exec mirofish-ollama ollama pull qwen3:8b
 docker exec mirofish-ollama ollama pull nomic-embed-text
 ```
 
-Open `http://localhost:3000` — that's it.
+Open `http://localhost:3000`.
 
-### Option B: Manual
+### Option B: Manual (recommended for Apple Silicon)
 
 **1. Start Neo4j**
 
 ```bash
 docker run -d --name neo4j \
   -p 7474:7474 -p 7687:7687 \
-  -e NEO4J_AUTH=neo4j/mirofish \
-  neo4j:5.15-community
+  -e NEO4J_AUTH=neo4j/mirofish123 \
+  neo4j:5.18-community
 ```
 
 **2. Start Ollama & pull models**
 
 ```bash
 ollama serve &
-ollama pull qwen2.5:32b      # LLM (or qwen2.5:14b for less VRAM)
-ollama pull nomic-embed-text  # Embeddings (768d)
+ollama pull qwen3:8b           # LLM (best tool-calling stability)
+ollama pull nomic-embed-text   # Embeddings (768d)
 ```
 
 **3. Configure & run backend**
 
 ```bash
 cp .env.example .env
-# Edit .env if your Neo4j/Ollama are on non-default ports
+# Edit .env: set LLM_PROVIDER=ollama, LLM_MODEL_NAME=qwen3:8b
 
 cd backend
 pip install -r requirements.txt
@@ -109,97 +144,74 @@ Open `http://localhost:3000`.
 
 ## Configuration
 
-All settings are in `.env` (copy from `.env.example`):
+All settings in `.env` (copy from `.env.example`):
 
 ```bash
-# LLM — points to local Ollama (OpenAI-compatible API)
+# LLM provider: "ollama" or "groq"
+LLM_PROVIDER=ollama
 LLM_API_KEY=ollama
 LLM_BASE_URL=http://localhost:11434/v1
-LLM_MODEL_NAME=qwen2.5:32b
+LLM_MODEL_NAME=qwen3:8b
 
 # Neo4j
 NEO4J_URI=bolt://localhost:7687
 NEO4J_USER=neo4j
-NEO4J_PASSWORD=mirofish
+NEO4J_PASSWORD=mirofish123
 
 # Embeddings
 EMBEDDING_MODEL=nomic-embed-text
 EMBEDDING_BASE_URL=http://localhost:11434
 ```
 
-Works with any OpenAI-compatible API — swap Ollama for Claude, GPT, or any other provider by changing `LLM_BASE_URL` and `LLM_API_KEY`.
+Works with any OpenAI-compatible API — swap Ollama for any other provider by changing `LLM_BASE_URL` and `LLM_API_KEY`.
 
-## Architecture
+## LLM Call Reduction
 
-This fork introduces a clean abstraction layer between the application and the graph database:
+The key optimization for local hardware. Three layers stack:
 
-```
-┌─────────────────────────────────────────┐
-│              Flask API                   │
-│  graph.py  simulation.py  report.py     │
-└──────────────┬──────────────────────────┘
-               │ app.extensions['neo4j_storage']
-┌──────────────▼──────────────────────────┐
-│           Service Layer                  │
-│  EntityReader  GraphToolsService         │
-│  GraphMemoryUpdater  ReportAgent         │
-└──────────────┬──────────────────────────┘
-               │ storage: GraphStorage
-┌──────────────▼──────────────────────────┐
-│         GraphStorage (abstract)          │
-│              │                            │
-│    ┌─────────▼─────────┐                │
-│    │   Neo4jStorage     │                │
-│    │  ┌───────────────┐ │                │
-│    │  │ EmbeddingService│ ← Ollama       │
-│    │  │ NERExtractor   │ ← Ollama LLM   │
-│    │  │ SearchService  │ ← Hybrid search │
-│    │  └───────────────┘ │                │
-│    └───────────────────┘                │
-└─────────────────────────────────────────┘
-               │
-        ┌──────▼──────┐
-        │  Neo4j CE   │
-        │  5.15       │
-        └─────────────┘
-```
+| Layer | What it does | Savings |
+|---|---|---|
+| **System One Router** | Non-text actions (like, follow, repost) resolved instantly via archetype-weighted sampling | ~60-70% of all decisions |
+| **Response Pool** | CREATE_POST reused from same-archetype agent with text variation (synonym swap, sentence reorder) | ~30% of remaining text actions |
+| **Agent Memory** | Tracks all actions; injects summary before LLM calls so agents stay contextually grounded | Better output quality |
 
-**Key design decisions:**
+Net result: **~75-80% of all agent decisions avoid LLM calls entirely.**
 
-- `GraphStorage` is an abstract interface — swap Neo4j for any other graph DB by implementing one class
-- Dependency injection via Flask `app.extensions` — no global singletons
-- Hybrid search: 0.7 × vector similarity + 0.3 × BM25 keyword search
-- Synchronous NER/RE extraction via local LLM (replaces Zep's async episodes)
-- All original dataclasses and LLM tools (InsightForge, Panorama, Agent Interviews) preserved
+### Behavioral Archetypes
+
+Each agent is assigned one of four archetypes that control their action distribution:
+
+| Archetype | Posts | Likes | Follows | Reposts | Does Nothing |
+|---|---|---|---|---|---|
+| **Lurker** | 3% | 15% | 5% | 2% | 75% |
+| **Amplifier** | 5% | 30% | 10% | 35% | 20% |
+| **Contributor** | 25% | 20% | 10% | 10% | 35% |
+| **Debater** | 30% | 10% | 5% | 15% | 40% |
 
 ## Hardware Requirements
 
-| Component | Minimum | Recommended |
+| Component | Minimum (qwen3:8b) | Recommended |
 |---|---|---|
 | RAM | 16 GB | 32 GB |
-| VRAM (GPU) | 10 GB (14b model) | 24 GB (32b model) |
-| Disk | 20 GB | 50 GB |
+| GPU/NPU | Apple M-series or 8GB VRAM | 16+ GB VRAM |
+| Disk | 15 GB | 30 GB |
 | CPU | 4 cores | 8+ cores |
 
-CPU-only mode works but is significantly slower for LLM inference. For lighter setups, use `qwen2.5:14b` or `qwen2.5:7b`.
+Tested on: M2 Pro 16GB (MacBook Pro). CPU-only mode works but is slower.
 
 ## Use Cases
 
 - **PR crisis testing** — simulate the public reaction to a press release before publishing
-- **Trading signal generation** — feed financial news and observe simulated market sentiment
-- **Policy impact analysis** — test draft regulations against simulated public response
-- **Creative experiments** — someone fed it a classical Chinese novel with a lost ending; the agents wrote a narratively consistent conclusion
+- **Market sentiment** — feed financial news and observe simulated social response
+- **Policy impact analysis** — test draft regulations against simulated public opinion
+- **Research** — multi-agent behavior studies with configurable archetype distributions
 
 ## License
 
 AGPL-3.0 — same as the original MiroFish project. See [LICENSE](./LICENSE).
 
-## Credits & Attribution
+## Credits
 
-This is a modified fork of [MiroFish](https://github.com/666ghj/MiroFish) by [666ghj](https://github.com/666ghj), originally supported by [Shanda Group](https://www.shanda.com/). The simulation engine is powered by [OASIS](https://github.com/camel-ai/oasis) from the CAMEL-AI team.
+Fork of [MiroFish](https://github.com/666ghj/MiroFish) by [666ghj](https://github.com/666ghj). Simulation engine powered by [OASIS](https://github.com/camel-ai/oasis) (CAMEL-AI).
 
-**Modifications in this fork:**
-- Backend migrated from Zep Cloud to local Neo4j CE 5.15 + Ollama
-- Entire frontend translated from Chinese to English (20 files, 1,000+ strings)
-- All Zep references replaced with Neo4j across the UI
-- Rebranded to MiroFish Offline
+**This fork adds:** full English translation, local-only operation (Neo4j CE + Ollama), System One action routing, behavioral archetypes, agent memory persistence, TopoSim-inspired response pooling, and ontology generation improvements.

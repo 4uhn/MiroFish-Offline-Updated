@@ -14,6 +14,7 @@ overly long content in a single pass:
 
 import json
 import math
+import os
 from typing import Dict, Any, List, Optional, Callable
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
@@ -27,7 +28,7 @@ from .entity_reader import EntityNode
 logger = get_logger('mirofish.simulation_config')
 
 # Default activity schedule configuration (UK timezone)
-CHINA_TIMEZONE_CONFIG = {
+DEFAULT_ACTIVITY_SCHEDULE = {
     # Dead hours (almost no activity)
     "dead_hours": [0, 1, 2, 3, 4, 5],
     # Morning hours (gradually waking up)
@@ -79,6 +80,10 @@ class AgentActivityConfig:
 
     # Influence weight (determines probability of posts being seen by other Agents)
     influence_weight: float = 1.0
+
+    # Behavioral archetype (lurker, amplifier, contributor, debater)
+    # Used by the System One router to decide actions without an LLM call
+    archetype: str = "contributor"
 
 
 @dataclass
@@ -253,6 +258,7 @@ class SimulationConfigGenerator:
         enable_twitter: bool = True,
         enable_reddit: bool = True,
         progress_callback: Optional[Callable[[int, int, str], None]] = None,
+        synthetic_personas: Optional[List[Dict[str, Any]]] = None,
     ) -> SimulationParameters:
         """
         Intelligently generate complete simulation configuration (step by step)
@@ -267,14 +273,19 @@ class SimulationConfigGenerator:
             enable_twitter: Whether to enable Twitter
             enable_reddit: Whether to enable Reddit
             progress_callback: Progress callback function(current_step, total_steps, message)
+            synthetic_personas: Synthetic individual personas to include in the simulation
 
         Returns:
             SimulationParameters: Complete simulation parameters
         """
-        logger.info(f"Starting intelligent simulation config generation: simulation_id={simulation_id}, entities={len(entities)}")
-        
+        synthetic_personas = synthetic_personas or []
+        total_agents = len(entities) + len(synthetic_personas)
+        logger.info(f"Starting intelligent simulation config generation: simulation_id={simulation_id}, entities={len(entities)}, synthetic={len(synthetic_personas)}")
+
         # Calculate total number of steps
-        num_batches = math.ceil(len(entities) / self.AGENTS_PER_BATCH)
+        num_entity_batches = math.ceil(len(entities) / self.AGENTS_PER_BATCH)
+        num_synthetic_batches = math.ceil(len(synthetic_personas) / self.AGENTS_PER_BATCH) if synthetic_personas else 0
+        num_batches = num_entity_batches + num_synthetic_batches
         total_steps = 3 + num_batches  # Time config + Event config + N Agent batches + Platform config
         current_step = 0
         
@@ -303,22 +314,26 @@ class SimulationConfigGenerator:
 
         # ========== Step 2: Generate event configuration ==========
         report_progress(2, "Generating event configuration and trending topics...")
-        event_config_result = self._generate_event_config(context, simulation_requirement, entities)
+        # Use the actual max rounds the simulation will run (from env config)
+        actual_max_rounds = int(os.environ.get('OASIS_DEFAULT_MAX_ROUNDS', '10'))
+        computed_rounds = time_config.total_simulation_hours // max(1, time_config.minutes_per_round // 60)
+        total_rounds = min(computed_rounds, actual_max_rounds) if actual_max_rounds > 0 else computed_rounds
+        event_config_result = self._generate_event_config(context, simulation_requirement, entities, total_rounds)
         event_config = self._parse_event_config(event_config_result)
         reasoning_parts.append(f"Event config: {event_config_result.get('reasoning', 'Success')}")
 
         # ========== Steps 3-N: Generate Agent configurations in batches ==========
         all_agent_configs = []
-        for batch_idx in range(num_batches):
+        for batch_idx in range(num_entity_batches):
             start_idx = batch_idx * self.AGENTS_PER_BATCH
             end_idx = min(start_idx + self.AGENTS_PER_BATCH, len(entities))
             batch_entities = entities[start_idx:end_idx]
-            
+
             report_progress(
                 3 + batch_idx,
-                f"Generating Agent configs ({start_idx + 1}-{end_idx}/{len(entities)})..."
+                f"Generating Agent configs ({start_idx + 1}-{end_idx}/{total_agents})..."
             )
-            
+
             batch_configs = self._generate_agent_configs_batch(
                 context=context,
                 entities=batch_entities,
@@ -326,14 +341,37 @@ class SimulationConfigGenerator:
                 simulation_requirement=simulation_requirement
             )
             all_agent_configs.extend(batch_configs)
-        
+
+        # Generate configs for synthetic individual personas
+        if synthetic_personas:
+            synthetic_start_idx = len(entities)
+            for batch_idx in range(num_synthetic_batches):
+                start_idx = batch_idx * self.AGENTS_PER_BATCH
+                end_idx = min(start_idx + self.AGENTS_PER_BATCH, len(synthetic_personas))
+                batch_personas = synthetic_personas[start_idx:end_idx]
+                agent_start_idx = synthetic_start_idx + start_idx
+
+                report_progress(
+                    3 + num_entity_batches + batch_idx,
+                    f"Generating synthetic agent configs ({agent_start_idx + 1}-{agent_start_idx + len(batch_personas)}/{total_agents})..."
+                )
+
+                batch_configs = self._generate_synthetic_agent_configs_batch(
+                    context=context,
+                    personas=batch_personas,
+                    start_idx=agent_start_idx,
+                    simulation_requirement=simulation_requirement,
+                )
+                all_agent_configs.extend(batch_configs)
+
         reasoning_parts.append(f"Agent config: successfully generated {len(all_agent_configs)}")
 
         # ========== Assign publisher Agents to initial posts ==========
         logger.info("Assigning suitable publisher Agents to initial posts...")
         event_config = self._assign_initial_post_agents(event_config, all_agent_configs)
         assigned_count = len([p for p in event_config.initial_posts if p.get("poster_agent_id") is not None])
-        reasoning_parts.append(f"Initial post assignment: {assigned_count} posts assigned to publishers")
+        scheduled_count = len([e for e in event_config.scheduled_events if e.get("poster_agent_id") is not None])
+        reasoning_parts.append(f"Post assignment: {assigned_count} initial + {scheduled_count} scheduled events assigned")
 
         # ========== Final step: Generate platform configuration ==========
         report_progress(total_steps, "Generating platform configuration...")
@@ -648,7 +686,8 @@ Field descriptions:
         self,
         context: str,
         simulation_requirement: str,
-        entities: List[EntityNode]
+        entities: List[EntityNode],
+        total_rounds: int = 10
     ) -> Dict[str, Any]:
         """Generate event configuration"""
 
@@ -665,12 +704,12 @@ Field descriptions:
                 type_examples[etype] = []
             if len(type_examples[etype]) < 3:
                 type_examples[etype].append(e.name)
-        
+
         type_info = "\n".join([
-            f"- {t}: {', '.join(examples)}" 
+            f"- {t}: {', '.join(examples)}"
             for t, examples in type_examples.items()
         ])
-        
+
         # Use configured context truncation length
         context_truncated = context[:self.EVENT_CONFIG_CONTEXT_LENGTH]
 
@@ -683,12 +722,15 @@ Simulation requirement: {simulation_requirement}
 ## Available Entity Types and Examples
 {type_info}
 
+## Simulation Structure
+The simulation will run for {total_rounds} rounds total. Use trigger_round to schedule events at specific rounds during the simulation to create a compelling narrative arc.
+
 ## Task
 Generate an event configuration JSON:
 - Extract trending topic keywords
 - Describe the narrative development direction
 - Design initial post content; **each post must specify a poster_type (publisher type)**
-- Design 3-6 scheduled events that will happen during the simulation to drive narrative progression (e.g., press conferences, new case announcements, policy changes, community reactions)
+- Design 3-6 scheduled events spread across the simulation rounds to drive narrative progression. Each event needs a trigger_round (1 to {total_rounds}) indicating when it fires. Space them out to create phases: early reaction, mid-simulation escalation, and late resolution/aftermath.
 
 **Important**: poster_type must be selected from the "Available Entity Types" listed above, so that initial posts can be assigned to the appropriate Agent for publishing.
 For example: official statements should be published by Official/University types, news by MediaOutlet, student opinions by Student.
@@ -702,8 +744,9 @@ Return JSON format (no markdown):
         ...
     ],
     "scheduled_events": [
-        {{"hour": 12, "description": "Brief event description", "poster_type": "Entity type", "content": "Post content triggered by this event"}},
-        ...
+        {{"trigger_round": 2, "description": "Brief event description", "poster_type": "Entity type", "content": "Post content triggered by this event"}},
+        {{"trigger_round": 5, "description": "Mid-simulation escalation", "poster_type": "Entity type", "content": "Post content for escalation"}},
+        {{"trigger_round": 8, "description": "Late resolution event", "poster_type": "Entity type", "content": "Post content for resolution"}}
     ],
     "reasoning": "<brief explanation>"
 }}"""
@@ -725,33 +768,19 @@ Return JSON format (no markdown):
         """Parse event configuration result"""
         return EventConfig(
             initial_posts=result.get("initial_posts", []),
-            scheduled_events=[],
+            scheduled_events=result.get("scheduled_events", []),
             hot_topics=result.get("hot_topics", []),
             narrative_direction=result.get("narrative_direction", "")
         )
     
-    def _assign_initial_post_agents(
+    def _match_agent_for_type(
         self,
-        event_config: EventConfig,
-        agent_configs: List[AgentActivityConfig]
-    ) -> EventConfig:
-        """
-        Assign suitable publisher Agents to initial posts
-
-        Match the most appropriate agent_id based on each post's poster_type
-        """
-        if not event_config.initial_posts:
-            return event_config
-        
-        # Build agent index by entity type
-        agents_by_type: Dict[str, List[AgentActivityConfig]] = {}
-        for agent in agent_configs:
-            etype = agent.entity_type.lower()
-            if etype not in agents_by_type:
-                agents_by_type[etype] = []
-            agents_by_type[etype].append(agent)
-        
-        # Type alias mapping (handle different formats LLM may output)
+        poster_type: str,
+        agents_by_type: Dict[str, List[AgentActivityConfig]],
+        agent_configs: List[AgentActivityConfig],
+        used_indices: Dict[str, int]
+    ) -> int:
+        """Match an agent_id for a given poster_type using direct match, aliases, or fallback."""
         type_aliases = {
             "official": ["official", "university", "governmentagency", "government"],
             "university": ["university", "official"],
@@ -762,57 +791,88 @@ Return JSON format (no markdown):
             "organization": ["organization", "ngo", "company", "group"],
             "person": ["person", "student", "alumni"],
         }
-        
-        # Track used agent indices per type to avoid reusing the same agent
-        used_indices: Dict[str, int] = {}
-        
-        updated_posts = []
-        for post in event_config.initial_posts:
-            poster_type = post.get("poster_type", "").lower()
-            content = post.get("content", "")
-            
-            # Try to find a matching agent
-            matched_agent_id = None
 
-            # 1. Direct match
-            if poster_type in agents_by_type:
-                agents = agents_by_type[poster_type]
-                idx = used_indices.get(poster_type, 0) % len(agents)
-                matched_agent_id = agents[idx].agent_id
-                used_indices[poster_type] = idx + 1
-            else:
-                # 2. Match using aliases
-                for alias_key, aliases in type_aliases.items():
-                    if poster_type in aliases or alias_key == poster_type:
-                        for alias in aliases:
-                            if alias in agents_by_type:
-                                agents = agents_by_type[alias]
-                                idx = used_indices.get(alias, 0) % len(agents)
-                                matched_agent_id = agents[idx].agent_id
-                                used_indices[alias] = idx + 1
-                                break
-                    if matched_agent_id is not None:
-                        break
-            
-            # 3. If still not found, use the agent with highest influence
-            if matched_agent_id is None:
-                logger.warning(f"No matching Agent found for type '{poster_type}', using highest influence Agent")
-                if agent_configs:
-                    # Sort by influence, select highest
-                    sorted_agents = sorted(agent_configs, key=lambda a: a.influence_weight, reverse=True)
-                    matched_agent_id = sorted_agents[0].agent_id
-                else:
-                    matched_agent_id = 0
-            
-            updated_posts.append({
-                "content": content,
-                "poster_type": post.get("poster_type", "Unknown"),
-                "poster_agent_id": matched_agent_id
-            })
-            
-            logger.info(f"Initial post assignment: poster_type='{poster_type}' -> agent_id={matched_agent_id}")
-        
-        event_config.initial_posts = updated_posts
+        poster_type_lower = poster_type.lower()
+
+        # 1. Direct match
+        if poster_type_lower in agents_by_type:
+            agents = agents_by_type[poster_type_lower]
+            idx = used_indices.get(poster_type_lower, 0) % len(agents)
+            used_indices[poster_type_lower] = idx + 1
+            return agents[idx].agent_id
+
+        # 2. Match using aliases
+        for alias_key, aliases in type_aliases.items():
+            if poster_type_lower in aliases or alias_key == poster_type_lower:
+                for alias in aliases:
+                    if alias in agents_by_type:
+                        agents = agents_by_type[alias]
+                        idx = used_indices.get(alias, 0) % len(agents)
+                        used_indices[alias] = idx + 1
+                        return agents[idx].agent_id
+
+        # 3. Fallback: highest influence agent
+        logger.warning(f"No matching Agent found for type '{poster_type}', using highest influence Agent")
+        if agent_configs:
+            sorted_agents = sorted(agent_configs, key=lambda a: a.influence_weight, reverse=True)
+            return sorted_agents[0].agent_id
+        return 0
+
+    def _assign_initial_post_agents(
+        self,
+        event_config: EventConfig,
+        agent_configs: List[AgentActivityConfig]
+    ) -> EventConfig:
+        """
+        Assign suitable publisher Agents to initial posts and scheduled events.
+
+        Match the most appropriate agent_id based on each post's poster_type.
+        """
+        # Build agent index by entity type
+        agents_by_type: Dict[str, List[AgentActivityConfig]] = {}
+        for agent in agent_configs:
+            etype = agent.entity_type.lower()
+            if etype not in agents_by_type:
+                agents_by_type[etype] = []
+            agents_by_type[etype].append(agent)
+
+        used_indices: Dict[str, int] = {}
+
+        # Assign agents to initial posts
+        if event_config.initial_posts:
+            updated_posts = []
+            for post in event_config.initial_posts:
+                poster_type = post.get("poster_type", "Unknown")
+                content = post.get("content", "")
+                matched_agent_id = self._match_agent_for_type(
+                    poster_type, agents_by_type, agent_configs, used_indices
+                )
+                updated_posts.append({
+                    "content": content,
+                    "poster_type": poster_type,
+                    "poster_agent_id": matched_agent_id
+                })
+                logger.info(f"Initial post assignment: poster_type='{poster_type}' -> agent_id={matched_agent_id}")
+            event_config.initial_posts = updated_posts
+
+        # Assign agents to scheduled events
+        if event_config.scheduled_events:
+            updated_events = []
+            for event in event_config.scheduled_events:
+                poster_type = event.get("poster_type", "Unknown")
+                matched_agent_id = self._match_agent_for_type(
+                    poster_type, agents_by_type, agent_configs, used_indices
+                )
+                updated_events.append({
+                    "trigger_round": event.get("trigger_round", 1),
+                    "description": event.get("description", ""),
+                    "content": event.get("content", ""),
+                    "poster_type": poster_type,
+                    "poster_agent_id": matched_agent_id
+                })
+                logger.info(f"Scheduled event assignment: round={event.get('trigger_round')}, poster_type='{poster_type}' -> agent_id={matched_agent_id}")
+            event_config.scheduled_events = updated_events
+
         return event_config
     
     def _generate_agent_configs_batch(
@@ -909,6 +969,184 @@ Return JSON format (no markdown):
         
         return configs
     
+    def _generate_synthetic_agent_configs_batch(
+        self,
+        context: str,
+        personas: List[Dict[str, Any]],
+        start_idx: int,
+        simulation_requirement: str,
+    ) -> List[AgentActivityConfig]:
+        """Generate Agent activity configurations for synthetic individual personas via LLM.
+
+        Uses persona metadata (role, archetype, emotional state, stance) to prompt
+        the LLM for realistic, differentiated activity parameters.  Falls back to
+        archetype-based defaults if the LLM call fails.
+        """
+
+        persona_list = []
+        for i, p in enumerate(personas):
+            persona_list.append({
+                "agent_id": start_idx + i,
+                "name": p["name"],
+                "role": p["role"],
+                "age": p["age"],
+                "archetype": p["archetype"],
+                "emotional_state": p["emotional_state"],
+                "stance": p["stance"],
+                "susceptible_to_misinfo": p.get("susceptible_to_misinfo", False),
+            })
+
+        prompt = f"""Based on the following information, generate realistic social media activity configurations for each INDIVIDUAL person (not an institution).
+
+Simulation requirement: {simulation_requirement}
+
+## Individual Personas
+```json
+{json.dumps(persona_list, ensure_ascii=False, indent=2)}
+```
+
+## Task
+Generate activity configurations for each individual person. These are REAL PEOPLE, not organizations. Their behavior should follow empirical social media patterns:
+
+- **Lurker archetype**: Very low activity (0.05-0.15), rarely posts, mostly reads. Posts 0-0.1/hour, comments 0.1-0.3/hour. DO_NOTHING most of the time.
+- **Amplifier archetype**: Moderate activity (0.3-0.5), mostly shares/reposts others' content. Posts 0.1-0.3/hour, comments 0.3-0.8/hour.
+- **Contributor archetype**: High activity (0.5-0.8), creates original content. Posts 0.3-0.8/hour, comments 0.5-1.0/hour.
+- **Debater archetype**: High activity (0.6-0.9), engages in arguments and replies. Posts 0.2-0.5/hour, comments 1.0-2.0/hour. Very responsive.
+
+Activity patterns by role:
+- **Parents**: Active mornings (7-9), lunch (12-13), and evenings (19-22). Not active during work hours.
+- **Students**: Active late morning (10-12), afternoons, and late evenings (20-24). Night owls.
+- **Journalists**: Active early morning through evening (7-22). Very fast response times (1-10 min).
+- **Local residents**: Sporadic, mainly evenings (18-22). Low overall activity.
+
+Emotional state affects behavior:
+- **angry** people post MORE frequently and with stronger sentiment bias (negative)
+- **worried/fearful** people comment more than they post (seeking reassurance)
+- **calm/curious** people have balanced activity and neutral sentiment
+
+Influence weight for individuals should be LOW (0.3-1.2) — they are not institutions.
+
+IMPORTANT: Make each person DISTINCT. A 52-year-old angry parent posts very differently from a 34-year-old calm journalist. Vary the parameters meaningfully.
+
+Return JSON format (no markdown):
+{{
+    "agent_configs": [
+        {{
+            "agent_id": <must match input>,
+            "activity_level": <0.0-1.0>,
+            "posts_per_hour": <posting frequency>,
+            "comments_per_hour": <commenting frequency>,
+            "active_hours": [<list of active hours>],
+            "response_delay_min": <min delay in minutes>,
+            "response_delay_max": <max delay in minutes>,
+            "sentiment_bias": <-1.0 to 1.0>,
+            "stance": "<supportive/opposing/neutral/observer/skeptical/fearful/angry>",
+            "influence_weight": <influence weight, typically 0.3-1.2 for individuals>
+        }},
+        ...
+    ]
+}}"""
+
+        system_prompt = (
+            "You are a social media behaviour analyst specializing in crisis communication dynamics. "
+            "You understand how different demographics behave online during public health and environmental crises. "
+            "Respond in English only. Return pure JSON. "
+            "Make each person's config DISTINCT — avoid giving everyone the same parameters."
+        )
+
+        try:
+            result = self._call_llm_with_retry(prompt, system_prompt)
+            llm_configs = {cfg["agent_id"]: cfg for cfg in result.get("agent_configs", [])}
+        except Exception as e:
+            logger.warning(f"Synthetic agent config LLM generation failed: {e}, using archetype-based fallback")
+            llm_configs = {}
+
+        configs = []
+        for i, persona in enumerate(personas):
+            agent_id = start_idx + i
+            cfg = llm_configs.get(agent_id, {})
+
+            if not cfg:
+                cfg = self._synthetic_config_fallback(persona)
+
+            config = AgentActivityConfig(
+                agent_id=agent_id,
+                entity_uuid=f"synthetic_{agent_id}",
+                entity_name=persona["name"],
+                entity_type=f"Synthetic_{persona.get('template', 'individual')}",
+                activity_level=cfg.get("activity_level", 0.5),
+                posts_per_hour=cfg.get("posts_per_hour", 0.3),
+                comments_per_hour=cfg.get("comments_per_hour", 0.8),
+                active_hours=cfg.get("active_hours", list(range(18, 23))),
+                response_delay_min=cfg.get("response_delay_min", 1),
+                response_delay_max=cfg.get("response_delay_max", 15),
+                sentiment_bias=cfg.get("sentiment_bias", 0.0),
+                stance=cfg.get("stance", persona.get("stance", "neutral")),
+                influence_weight=cfg.get("influence_weight", 0.8),
+                archetype=persona.get("archetype", "contributor"),
+            )
+            configs.append(config)
+
+        return configs
+
+    def _synthetic_config_fallback(self, persona: Dict[str, Any]) -> Dict[str, Any]:
+        """Archetype-based fallback config for a synthetic persona when LLM fails."""
+        archetype = persona.get("archetype", "contributor")
+        role = persona.get("role", "").lower()
+        emotional = persona.get("emotional_state", "calm")
+
+        # Base config by archetype
+        archetype_defaults = {
+            "lurker": {
+                "activity_level": 0.1,
+                "posts_per_hour": 0.05,
+                "comments_per_hour": 0.15,
+                "response_delay_min": 10,
+                "response_delay_max": 60,
+            },
+            "amplifier": {
+                "activity_level": 0.4,
+                "posts_per_hour": 0.15,
+                "comments_per_hour": 0.5,
+                "response_delay_min": 3,
+                "response_delay_max": 20,
+            },
+            "contributor": {
+                "activity_level": 0.6,
+                "posts_per_hour": 0.5,
+                "comments_per_hour": 0.8,
+                "response_delay_min": 2,
+                "response_delay_max": 15,
+            },
+            "debater": {
+                "activity_level": 0.7,
+                "posts_per_hour": 0.3,
+                "comments_per_hour": 1.5,
+                "response_delay_min": 1,
+                "response_delay_max": 10,
+            },
+        }
+
+        cfg = archetype_defaults.get(archetype, archetype_defaults["contributor"]).copy()
+
+        # Active hours by role
+        if "parent" in role:
+            cfg["active_hours"] = [7, 8, 9, 12, 13, 19, 20, 21, 22]
+        elif "student" in role:
+            cfg["active_hours"] = [10, 11, 12, 13, 14, 20, 21, 22, 23]
+        elif "journalist" in role:
+            cfg["active_hours"] = list(range(7, 23))
+        else:
+            cfg["active_hours"] = [9, 10, 11, 12, 18, 19, 20, 21, 22]
+
+        # Emotional state affects sentiment
+        sentiment_map = {"angry": -0.6, "fearful": -0.3, "worried": -0.2, "calm": 0.0, "curious": 0.1}
+        cfg["sentiment_bias"] = sentiment_map.get(emotional, 0.0)
+        cfg["stance"] = persona.get("stance", "neutral")
+        cfg["influence_weight"] = 0.8
+
+        return cfg
+
     def _generate_agent_config_by_rule(self, entity: EntityNode) -> Dict[str, Any]:
         """Generate a single Agent config based on rules (typical daily patterns)"""
         entity_type = (entity.get_entity_type() or "Unknown").lower()

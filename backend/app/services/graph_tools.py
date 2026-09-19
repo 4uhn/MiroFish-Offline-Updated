@@ -1080,186 +1080,9 @@ Return the sub-question list in JSON format."""
         logger.info(f"QuickSearch complete: {result.total_count} results")
         return result
 
-    def interview_agents(
-        self,
-        simulation_id: str,
-        interview_requirement: str,
-        simulation_requirement: str = "",
-        max_agents: int = 5,
-        custom_questions: List[str] = None
-    ) -> InterviewResult:
-        """
-        [InterviewAgents - In-Depth Interview]
-
-        Calls the real OASIS interview API to interview agents running in the simulation.
-        This method does NOT use GraphStorage — it calls SimulationRunner
-        and reads agent profiles from disk.
-        """
-        from .simulation_runner import SimulationRunner
-
-        logger.info(f"InterviewAgents in-depth interview (real API): {interview_requirement[:50]}...")
-
-        result = InterviewResult(
-            interview_topic=interview_requirement,
-            interview_questions=custom_questions or []
-        )
-
-        # Step 1: Load agent profile files
-        profiles = self._load_agent_profiles(simulation_id)
-
-        if not profiles:
-            logger.warning(f"No agent profile files found for simulation {simulation_id}")
-            result.summary = "No agent profile files found for interviews"
-            return result
-
-        result.total_agents = len(profiles)
-        logger.info(f"Loaded {len(profiles)} agent profiles")
-
-        # Step 2: Use LLM to select agents for interview
-        selected_agents, selected_indices, selection_reasoning = self._select_agents_for_interview(
-            profiles=profiles,
-            interview_requirement=interview_requirement,
-            simulation_requirement=simulation_requirement,
-            max_agents=max_agents
-        )
-
-        result.selected_agents = selected_agents
-        result.selection_reasoning = selection_reasoning
-        logger.info(f"Selected {len(selected_agents)} agents for interview: {selected_indices}")
-
-        # Step 3: Generate interview questions
-        if not result.interview_questions:
-            result.interview_questions = self._generate_interview_questions(
-                interview_requirement=interview_requirement,
-                simulation_requirement=simulation_requirement,
-                selected_agents=selected_agents
-            )
-            logger.info(f"Generated {len(result.interview_questions)} interview questions")
-
-        combined_prompt = "\n".join([f"{i+1}. {q}" for i, q in enumerate(result.interview_questions)])
-
-        INTERVIEW_PROMPT_PREFIX = (
-            "You are being interviewed. Please draw on your persona, all past memories, and actions "
-            "to answer the following questions directly in plain text.\n"
-            "Response requirements:\n"
-            "1. Answer directly in natural language, do not call any tools\n"
-            "2. Do not return JSON format or tool call format\n"
-            "3. Do not use Markdown headings (e.g., #, ##, ###)\n"
-            "4. Answer each question in order, starting each answer with 'Question X:' (X is the question number)\n"
-            "5. Separate answers to different questions with blank lines\n"
-            "6. Provide substantive content, at least 2-3 sentences per question\n\n"
-        )
-        optimized_prompt = f"{INTERVIEW_PROMPT_PREFIX}{combined_prompt}"
-
-        # Step 4: Call the real interview API
-        try:
-            interviews_request = []
-            for agent_idx in selected_indices:
-                interviews_request.append({
-                    "agent_id": agent_idx,
-                    "prompt": optimized_prompt
-                })
-
-            logger.info(f"Calling batch interview API (dual platform): {len(interviews_request)} agents")
-
-            api_result = SimulationRunner.interview_agents_batch(
-                simulation_id=simulation_id,
-                interviews=interviews_request,
-                platform=None,
-                timeout=600.0
-            )
-
-            logger.info(f"Interview API returned: {api_result.get('interviews_count', 0)} results, success={api_result.get('success')}")
-
-            if not api_result.get("success", False):
-                error_msg = api_result.get("error", "Unknown error")
-                logger.warning(f"Interview API returned failure: {error_msg}")
-                result.summary = f"Interview API call failed: {error_msg}. Please check the OASIS simulation environment status."
-                return result
-
-            # Step 5: Parse API response
-            api_data = api_result.get("result", {})
-            results_dict = api_data.get("results", {}) if isinstance(api_data, dict) else {}
-
-            for i, agent_idx in enumerate(selected_indices):
-                agent = selected_agents[i]
-                agent_name = agent.get("realname", agent.get("username", f"Agent_{agent_idx}"))
-                agent_role = agent.get("profession", "Unknown")
-                agent_bio = agent.get("bio", "")
-
-                twitter_result = results_dict.get(f"twitter_{agent_idx}", {})
-                reddit_result = results_dict.get(f"reddit_{agent_idx}", {})
-
-                twitter_response = twitter_result.get("response", "")
-                reddit_response = reddit_result.get("response", "")
-
-                twitter_response = self._clean_tool_call_response(twitter_response)
-                reddit_response = self._clean_tool_call_response(reddit_response)
-
-                twitter_text = twitter_response if twitter_response else "(No response received from this platform)"
-                reddit_text = reddit_response if reddit_response else "(No response received from this platform)"
-                response_text = f"[Twitter Platform Response]\n{twitter_text}\n\n[Reddit Platform Response]\n{reddit_text}"
-
-                import re
-                combined_responses = f"{twitter_response} {reddit_response}"
-
-                clean_text = re.sub(r'#{1,6}\s+', '', combined_responses)
-                clean_text = re.sub(r'\{[^}]*tool_name[^}]*\}', '', clean_text)
-                clean_text = re.sub(r'[*_`|>~\-]{2,}', '', clean_text)
-                clean_text = re.sub(r'(?:问题|Question)\s*\d+[：:]\s*', '', clean_text)
-                clean_text = re.sub(r'【[^】]+】', '', clean_text)
-
-                sentences = re.split(r'[。！？]', clean_text)
-                meaningful = [
-                    s.strip() for s in sentences
-                    if 20 <= len(s.strip()) <= 150
-                    and not re.match(r'^[\s\W，,；;：:、]+', s.strip())
-                    and not s.strip().startswith(('{', '问题', 'Question'))
-                ]
-                meaningful.sort(key=len, reverse=True)
-                key_quotes = [s + "。" for s in meaningful[:3]]
-
-                if not key_quotes:
-                    paired = re.findall(r'\u201c([^\u201c\u201d]{15,100})\u201d', clean_text)
-                    paired += re.findall(r'\u300c([^\u300c\u300d]{15,100})\u300d', clean_text)
-                    key_quotes = [q for q in paired if not re.match(r'^[，,；;：:、]', q)][:3]
-
-                interview = AgentInterview(
-                    agent_name=agent_name,
-                    agent_role=agent_role,
-                    agent_bio=agent_bio[:1000],
-                    question=combined_prompt,
-                    response=response_text,
-                    key_quotes=key_quotes[:5]
-                )
-                result.interviews.append(interview)
-
-            result.interviewed_count = len(result.interviews)
-
-        except ValueError as e:
-            logger.warning(f"Interview API call failed (environment not running?): {e}")
-            result.summary = f"Interview failed: {str(e)}. The simulation environment may be shut down. Please ensure the OASIS environment is running."
-            return result
-        except Exception as e:
-            logger.error(f"Interview API call exception: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            result.summary = f"An error occurred during the interview: {str(e)}"
-            return result
-
-        # Step 6: Generate interview summary
-        if result.interviews:
-            result.summary = self._generate_interview_summary(
-                interviews=result.interviews,
-                interview_requirement=interview_requirement
-            )
-
-        logger.info(f"InterviewAgents complete: interviewed {result.interviewed_count} agents (dual platform)")
-        return result
-
     @staticmethod
     def _clean_tool_call_response(response: str) -> str:
-        """Clean JSON tool call wrappers from agent responses, extracting actual content"""
+        """Clean JSON tool call wrappers from agent responses, extracting actual content."""
         if not response or not response.strip().startswith('{'):
             return response
         text = response.strip()
@@ -1277,6 +1100,90 @@ Return the sub-question list in JSON format."""
             if match:
                 return match.group(1).replace('\\n', '\n').replace('\\"', '"')
         return response
+
+    def interview_agents(
+        self,
+        simulation_id: str,
+        interview_requirement: str,
+        simulation_requirement: str = "",
+        max_agents: int = 5,
+        custom_questions: List[str] = None
+    ) -> InterviewResult:
+        """Call OASIS interview API to get first-person agent responses."""
+        from ..services.simulation_runner import SimulationRunner
+
+        profiles = self._load_agent_profiles(simulation_id)
+        if not profiles:
+            return InterviewResult(
+                interview_topic=interview_requirement,
+                interview_questions=[],
+                summary="No agent profiles found for this simulation.",
+                total_agents=0,
+                interviewed_count=0
+            )
+
+        selected_agents, selected_indices, reasoning = self._select_agents_for_interview(
+            profiles, interview_requirement, simulation_requirement, max_agents
+        )
+
+        questions = custom_questions or self._generate_interview_questions(
+            interview_requirement, simulation_requirement, selected_agents
+        )
+
+        interviews = []
+        env_alive = SimulationRunner.check_env_alive(simulation_id)
+
+        for agent_profile, agent_idx in zip(selected_agents, selected_indices):
+            agent_name = agent_profile.get("realname", agent_profile.get("name", agent_profile.get("username", f"Agent_{agent_idx}")))
+            agent_role = agent_profile.get("profession", "Participant")
+            agent_bio = agent_profile.get("bio", "")[:150]
+            agent_id = agent_profile.get("user_id", agent_idx)
+
+            combined_question = " ".join(questions)
+
+            response_text = ""
+            if env_alive:
+                try:
+                    result = SimulationRunner.interview_agent(
+                        simulation_id=simulation_id,
+                        agent_id=agent_id,
+                        prompt=combined_question,
+                        timeout=60.0
+                    )
+                    if result.get("success"):
+                        raw = result.get("result", "")
+                        if isinstance(raw, dict):
+                            response_text = raw.get("response", str(raw))
+                        else:
+                            response_text = str(raw)
+                        response_text = self._clean_tool_call_response(response_text)
+                except Exception as e:
+                    logger.warning(f"Live interview failed for {agent_name}: {e}")
+
+            if not response_text:
+                response_text = f"[Simulation environment not available — {agent_name} could not be interviewed live.]"
+
+            interview = AgentInterview(
+                agent_name=agent_name,
+                agent_role=agent_role,
+                agent_bio=agent_bio,
+                question=combined_question,
+                response=response_text,
+            )
+            interviews.append(interview)
+
+        summary = self._generate_interview_summary(interviews, interview_requirement)
+
+        return InterviewResult(
+            interview_topic=interview_requirement,
+            interview_questions=questions,
+            selected_agents=[{"name": a.get("realname", a.get("name", "?")), "role": a.get("profession", "?")} for a in selected_agents],
+            interviews=interviews,
+            selection_reasoning=reasoning,
+            summary=summary,
+            total_agents=len(profiles),
+            interviewed_count=len(interviews)
+        )
 
     def _load_agent_profiles(self, simulation_id: str) -> List[Dict[str, Any]]:
         """Load agent profile files for a simulation"""

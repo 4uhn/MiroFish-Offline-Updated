@@ -1056,79 +1056,44 @@ Important:
         
         logger.info(f"Saved {len(profiles)} Twitter Profiles to {file_path} (OASIS CSV format)")
     
-    def _normalize_gender(self, gender: Optional[str]) -> str:
-        """
-        Normalize the gender field to OASIS required English format.
-
-        OASIS requires: male, female, other
-        """
-        if not gender:
-            return "other"
-        
-        gender_lower = gender.lower().strip()
-        
-        # Chinese and English mapping
-        gender_map = {
-            "男": "male",
-            "女": "female",
-            "机构": "other",
-            "其他": "other",
-            # English already handled
-            "male": "male",
-            "female": "female",
-            "other": "other",
-        }
-        
-        return gender_map.get(gender_lower, "other")
-    
     def _save_reddit_json(self, profiles: List[OasisAgentProfile], file_path: str):
-        """
-        Save Reddit Profiles as JSON format.
-
-        Uses the same format as to_reddit_format() to ensure OASIS can read correctly.
-        Must include the user_id field - this is critical for OASIS agent_graph.get_agent() matching!
-
-        Required fields:
-        - user_id: User ID (integer, used to match poster_agent_id in initial_posts)
-        - username: Username
-        - name: Display name
-        - bio: Bio
-        - persona: Detailed persona
-        - age: Age (integer)
-        - gender: "male", "female", or "other"
-        - mbti: MBTI type
-        - country: Country
-        """
+        """Save Reddit profiles as JSON format for OASIS."""
         data = []
         for idx, profile in enumerate(profiles):
-            # Use format consistent with to_reddit_format()
             item = {
-                "user_id": profile.user_id if profile.user_id is not None else idx,  # Critical: must include user_id
+                "user_id": profile.user_id if profile.user_id is not None else idx,
                 "username": profile.user_name,
                 "name": profile.name,
                 "bio": profile.bio[:150] if profile.bio else f"{profile.name}",
                 "persona": profile.persona or f"{profile.name} is a participant in social discussions.",
                 "karma": profile.karma if profile.karma else 1000,
                 "created_at": profile.created_at,
-                # OASIS required fields - ensure all have default values
                 "age": profile.age if profile.age else 30,
                 "gender": self._normalize_gender(profile.gender),
                 "mbti": profile.mbti if profile.mbti else "ISTJ",
                 "country": profile.country if profile.country else "US",
             }
-            
-            # Optional fields
             if profile.profession:
                 item["profession"] = profile.profession
             if profile.interested_topics:
                 item["interested_topics"] = profile.interested_topics
-            
             data.append(item)
-        
+
         with open(file_path, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
-        
-        logger.info(f"Saved {len(profiles)} Reddit Profiles to {file_path} (JSON format, includes user_id field)")
+
+        logger.info(f"Saved {len(profiles)} Reddit Profiles to {file_path} (JSON format)")
+
+    def _normalize_gender(self, gender: Optional[str]) -> str:
+        """Normalize gender field to OASIS format: male, female, or other."""
+        if not gender:
+            return "other"
+        g = gender.strip().lower()
+        if g in ("male", "m", "man"):
+            return "male"
+        if g in ("female", "f", "woman"):
+            return "female"
+        return "other"
     
     # Keep old method name as alias for backward compatibility
     def save_profiles_to_json(

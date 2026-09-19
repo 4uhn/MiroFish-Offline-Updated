@@ -49,9 +49,27 @@ mytest/
 test-docs/
 
 backend/logs/
+log/
 *.log
 
 backend/uploads/
 
+# Agent memory DBs (created at runtime)
+*_agent_memory.db
+
 data/backend/venv311/
 backend/venv311/
+
+# Simulation output databases (created at runtime)
+*_simulation.db
+*_simulation.db-journal
+*_simulation.db-wal
+*_simulation.db-shm
+
+# Synthetic persona output (regenerated each run)
+synthetic_personas.json
+
+# OASIS runtime
+*.db-journal
+*.db-wal
+*.db-shm

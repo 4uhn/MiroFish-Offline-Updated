@@ -1,11 +1,13 @@
 """
 Ontology Generation Service
-Interface 1: Analyze text content and generate entity and relationship type definitions for social simulation.
+Analyze text content and generate entity and relationship type definitions for social simulation.
 """
 
-import json
+import logging
 from typing import Dict, Any, List, Optional
 from ..utils.llm_client import LLMClient
+
+logger = logging.getLogger('mirofish.ontology')
 
 
 # System prompt for ontology generation
@@ -163,8 +165,12 @@ class OntologyGenerator:
     Analyzes text content and generates entity and relationship type definitions.
     """
     
+    # Ontology generation needs a larger context window than post generation.
+    # 8192 tokens fits comfortably on M2 Pro 16GB with qwen3:8b.
+    ONTOLOGY_NUM_CTX = 8192
+
     def __init__(self, llm_client: Optional[LLMClient] = None):
-        self.llm_client = llm_client or LLMClient()
+        self.llm_client = llm_client or LLMClient(num_ctx=self.ONTOLOGY_NUM_CTX)
     
     def generate(
         self,
@@ -183,33 +189,88 @@ class OntologyGenerator:
         Returns:
             Ontology definition (entity_types, edge_types, etc.)
         """
-        # Build user message
         user_message = self._build_user_message(
-            document_texts, 
+            document_texts,
             simulation_requirement,
             additional_context
         )
-        
+
         messages = [
             {"role": "system", "content": ONTOLOGY_SYSTEM_PROMPT},
             {"role": "user", "content": user_message}
         ]
-        
-        # Call LLM
-        result = self.llm_client.chat_json(
-            messages=messages,
-            temperature=0.3,
-            max_tokens=4096
-        )
-        
-        # Validate and post-process
+
+        total_chars = sum(len(m["content"]) for m in messages)
+        logger.info(f"Generating ontology — {len(document_texts)} docs, {total_chars:,} chars to LLM")
+
+        # Local LLMs can be flaky with JSON — retry once on parse failure
+        last_error = None
+        for attempt in range(2):
+            try:
+                result = self.llm_client.chat_json(
+                    messages=messages,
+                    temperature=0.3,
+                    max_tokens=4096
+                )
+                break
+            except ValueError as e:
+                last_error = e
+                if attempt == 0:
+                    logger.warning(f"JSON parse failed, retrying: {e}")
+                    continue
+                raise last_error
+
         result = self._validate_and_process(result)
-        
+        logger.info(
+            f"Ontology generated: {len(result.get('entity_types', []))} entities, "
+            f"{len(result.get('edge_types', []))} edges"
+        )
         return result
     
-    # Maximum text length sent to LLM (50,000 characters)
-    MAX_TEXT_LENGTH_FOR_LLM = 50000
-    
+    # ~20K chars of document text fits within 8192 token context alongside
+    # the system prompt (~1200 tokens) and output (~2000 tokens).
+    MAX_TEXT_LENGTH_FOR_LLM = 20000
+
+    # Number of evenly-spaced chunks to sample from long documents.
+    SAMPLE_CHUNKS = 5
+
+    def _sample_long_text(self, text: str) -> str:
+        """Sample representative chunks from across a long document.
+
+        Instead of truncating (which loses everything after the cutoff),
+        this takes evenly-spaced chunks so the LLM sees the full arc of
+        the document — intro, middle sections, and conclusion.
+        """
+        if len(text) <= self.MAX_TEXT_LENGTH_FOR_LLM:
+            return text
+
+        original_length = len(text)
+        chunk_size = self.MAX_TEXT_LENGTH_FOR_LLM // self.SAMPLE_CHUNKS
+        step = (original_length - chunk_size) / max(self.SAMPLE_CHUNKS - 1, 1)
+
+        chunks = []
+        for i in range(self.SAMPLE_CHUNKS):
+            start = int(i * step)
+            end = start + chunk_size
+            chunk = text[start:end]
+
+            # Trim to the nearest sentence boundary to avoid mid-word cuts
+            if i < self.SAMPLE_CHUNKS - 1:
+                for delim in ('.', '!', '?', '\n'):
+                    last = chunk.rfind(delim)
+                    if last > chunk_size // 2:
+                        chunk = chunk[:last + 1]
+                        break
+
+            chunks.append(chunk.strip())
+
+        sampled = "\n\n[...]\n\n".join(chunks)
+        logger.info(
+            f"Sampled {self.SAMPLE_CHUNKS} chunks from {original_length:,} char document "
+            f"(reduced to {len(sampled):,} chars)"
+        )
+        return sampled
+
     def _build_user_message(
         self,
         document_texts: List[str],
@@ -217,15 +278,8 @@ class OntologyGenerator:
         additional_context: Optional[str]
     ) -> str:
         """Build the user message."""
-
-        # Combine texts
         combined_text = "\n\n---\n\n".join(document_texts)
-        original_length = len(combined_text)
-
-        # Truncate if text exceeds 50,000 characters (only affects LLM input, not graph construction)
-        if len(combined_text) > self.MAX_TEXT_LENGTH_FOR_LLM:
-            combined_text = combined_text[:self.MAX_TEXT_LENGTH_FOR_LLM]
-            combined_text += f"\n\n...(Original text: {original_length} characters. Truncated to first {self.MAX_TEXT_LENGTH_FOR_LLM} characters for ontology analysis)..."
+        combined_text = self._sample_long_text(combined_text)
 
         message = f"""## Simulation Requirement
 
@@ -253,16 +307,16 @@ Based on the above content, design entity types and relationship types suitable 
 4. All entity types must be real-world agents that can post on social media, not abstract concepts
 5. Attribute names must NOT use reserved words like name, uuid, group_id — use full_name, org_name, etc. instead
 """
-        
+
         return message
     
     def _validate_and_process(self, result: Dict[str, Any]) -> Dict[str, Any]:
         """Validate and post-process results."""
-
-        # Ensure required fields exist
         if "entity_types" not in result:
+            logger.warning("LLM returned no entity_types — using empty list")
             result["entity_types"] = []
         if "edge_types" not in result:
+            logger.warning("LLM returned no edge_types — will generate defaults")
             result["edge_types"] = []
         if "analysis_summary" not in result:
             result["analysis_summary"] = ""
@@ -360,106 +414,4 @@ Based on the above content, design entity types and relationship types suitable 
         
         return result
     
-    def generate_python_code(self, ontology: Dict[str, Any]) -> str:
-        """
-        [DEPRECATED] Convert ontology definitions to Zep-format Pydantic code.
-        Not used in MiroFish-Offline (ontology stored as JSON in Neo4j).
-        Kept for reference only.
-        """
-        code_lines = [
-            '"""',
-            'Custom Entity Type Definitions',
-            'Auto-generated by MiroFish for social opinion simulation',
-            '"""',
-            '',
-            'from pydantic import Field',
-            'from zep_cloud.external_clients.ontology import EntityModel, EntityText, EdgeModel',
-            '',
-            '',
-            '# ============== Entity Type Definitions ==============',
-            '',
-        ]
-        
-        # Generate entity types
-        for entity in ontology.get("entity_types", []):
-            name = entity["name"]
-            desc = entity.get("description", f"A {name} entity.")
-            
-            code_lines.append(f'class {name}(EntityModel):')
-            code_lines.append(f'    """{desc}"""')
-            
-            attrs = entity.get("attributes", [])
-            if attrs:
-                for attr in attrs:
-                    attr_name = attr["name"]
-                    attr_desc = attr.get("description", attr_name)
-                    code_lines.append(f'    {attr_name}: EntityText = Field(')
-                    code_lines.append(f'        description="{attr_desc}",')
-                    code_lines.append(f'        default=None')
-                    code_lines.append(f'    )')
-            else:
-                code_lines.append('    pass')
-            
-            code_lines.append('')
-            code_lines.append('')
-        
-        code_lines.append('# ============== Relationship Type Definitions ==============')
-        code_lines.append('')
-        
-        # Generate relationship types
-        for edge in ontology.get("edge_types", []):
-            name = edge["name"]
-            # Convert to PascalCase class name
-            class_name = ''.join(word.capitalize() for word in name.split('_'))
-            desc = edge.get("description", f"A {name} relationship.")
-            
-            code_lines.append(f'class {class_name}(EdgeModel):')
-            code_lines.append(f'    """{desc}"""')
-            
-            attrs = edge.get("attributes", [])
-            if attrs:
-                for attr in attrs:
-                    attr_name = attr["name"]
-                    attr_desc = attr.get("description", attr_name)
-                    code_lines.append(f'    {attr_name}: EntityText = Field(')
-                    code_lines.append(f'        description="{attr_desc}",')
-                    code_lines.append(f'        default=None')
-                    code_lines.append(f'    )')
-            else:
-                code_lines.append('    pass')
-            
-            code_lines.append('')
-            code_lines.append('')
-        
-        # Generate type dictionaries
-        code_lines.append('# ============== Type Configuration ==============')
-        code_lines.append('')
-        code_lines.append('ENTITY_TYPES = {')
-        for entity in ontology.get("entity_types", []):
-            name = entity["name"]
-            code_lines.append(f'    "{name}": {name},')
-        code_lines.append('}')
-        code_lines.append('')
-        code_lines.append('EDGE_TYPES = {')
-        for edge in ontology.get("edge_types", []):
-            name = edge["name"]
-            class_name = ''.join(word.capitalize() for word in name.split('_'))
-            code_lines.append(f'    "{name}": {class_name},')
-        code_lines.append('}')
-        code_lines.append('')
-        
-        # Generate edge source_targets mapping
-        code_lines.append('EDGE_SOURCE_TARGETS = {')
-        for edge in ontology.get("edge_types", []):
-            name = edge["name"]
-            source_targets = edge.get("source_targets", [])
-            if source_targets:
-                st_list = ', '.join([
-                    f'{{"source": "{st.get("source", "Entity")}", "target": "{st.get("target", "Entity")}"}}'
-                    for st in source_targets
-                ])
-                code_lines.append(f'    "{name}": [{st_list}],')
-        code_lines.append('}')
-        
-        return '\n'.join(code_lines)
 
