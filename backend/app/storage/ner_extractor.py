@@ -4,12 +4,16 @@ NER/RE Extractor — entity and relation extraction via local LLM
 Replaces Zep Cloud's built-in NER/RE pipeline.
 Uses LLMClient.chat_json() with a structured prompt to extract
 entities and relations from text chunks, guided by the graph's ontology.
+
+Tiered model routing: uses the fast model (e.g. qwen3:0.6b) for extraction
+when available, with automatic fallback to the quality model on failure.
 """
 
 import logging
 from typing import Dict, Any, List, Optional
 
 from ..utils.llm_client import LLMClient
+from ..utils.model_router import get_router, TaskType
 
 logger = logging.getLogger('mirofish.ner_extractor')
 
@@ -44,11 +48,22 @@ _USER_PROMPT = """Extract entities and relations from the following text:
 
 
 class NERExtractor:
-    """Extract entities and relations from text using local LLM."""
+    """Extract entities and relations from text using local LLM.
+
+    Uses the fast model tier (e.g. qwen3:0.6b) when available. If the fast
+    model fails to produce valid JSON after retries, falls back to the
+    quality model (e.g. qwen3:8b) for one final attempt.
+    """
 
     def __init__(self, llm_client: Optional[LLMClient] = None, max_retries: int = 2):
-        self.llm = llm_client or LLMClient()
+        router = get_router()
+        self.llm = llm_client or router.get_client(TaskType.EXTRACTION)
+        self._quality_fallback = (
+            router.get_quality_client() if router.fast_available else None
+        )
         self.max_retries = max_retries
+        self._fast_calls = 0
+        self._fallback_calls = 0
 
     def extract(self, text: str, ontology: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -59,11 +74,7 @@ class NERExtractor:
             ontology: Dict with 'entity_types' and 'relation_types' from graph
 
         Returns:
-            Dict with 'entities' and 'relations' lists:
-            {
-                "entities": [{"name": str, "type": str, "attributes": dict}],
-                "relations": [{"source": str, "target": str, "type": str, "fact": str}]
-            }
+            Dict with 'entities' and 'relations' lists
         """
         if not text or not text.strip():
             return {"entities": [], "relations": []}
@@ -82,26 +93,48 @@ class NERExtractor:
             try:
                 result = self.llm.chat_json(
                     messages=messages,
-                    temperature=0.1,  # Low temp for extraction precision
+                    temperature=0.1,
                     max_tokens=4096,
                 )
+                self._fast_calls += 1
                 return self._validate_and_clean(result, ontology)
 
             except ValueError as e:
                 last_error = e
                 logger.warning(
-                    f"NER extraction failed (attempt {attempt + 1}): invalid JSON — {e}"
+                    "NER extraction failed (attempt %d/%d): invalid JSON — %s",
+                    attempt + 1, self.max_retries + 1, e,
                 )
             except Exception as e:
                 last_error = e
-                logger.error(f"NER extraction error: {e}")
+                logger.error("NER extraction error: %s", e)
                 if attempt >= self.max_retries:
                     break
 
+        if self._quality_fallback is not None:
+            logger.info("Fast model failed NER — falling back to quality model")
+            try:
+                result = self._quality_fallback.chat_json(
+                    messages=messages,
+                    temperature=0.1,
+                    max_tokens=4096,
+                )
+                self._fallback_calls += 1
+                return self._validate_and_clean(result, ontology)
+            except Exception as e:
+                logger.error("Quality fallback also failed: %s", e)
+
         logger.error(
-            f"NER extraction failed after {self.max_retries + 1} attempts: {last_error}"
+            "NER extraction failed after all attempts: %s", last_error
         )
         return {"entities": [], "relations": []}
+
+    @property
+    def routing_stats(self) -> Dict[str, int]:
+        return {
+            "fast_calls": self._fast_calls,
+            "fallback_calls": self._fallback_calls,
+        }
 
     def _format_ontology(self, ontology: Dict[str, Any]) -> str:
         """Format ontology dict into readable text for the LLM prompt."""

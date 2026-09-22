@@ -1285,17 +1285,17 @@ class SimulationRunner:
         agent_id: int,
         prompt: str,
         platform: str = None,
-        timeout: float = 60.0
+        timeout: float = 120.0
     ) -> Dict[str, Any]:
         """"""
         sim_dir = os.path.join(cls.RUN_STATE_DIR, simulation_id)
         if not os.path.exists(sim_dir):
-            raise ValueError(f": {simulation_id}")
+            raise ValueError(f"Simulation not found: {simulation_id}")
 
         ipc_client = SimulationIPCClient(sim_dir)
 
         if not ipc_client.check_env_alive():
-            raise ValueError(f"Interview: {simulation_id}")
+            raise ValueError(f"Simulation environment is not running. Agent interviews are only available while the simulation is active.")
 
         logger.info(f"Interview: simulation_id={simulation_id}, agent_id={agent_id}, platform={platform}")
 
@@ -1334,12 +1334,12 @@ class SimulationRunner:
         """"""
         sim_dir = os.path.join(cls.RUN_STATE_DIR, simulation_id)
         if not os.path.exists(sim_dir):
-            raise ValueError(f": {simulation_id}")
+            raise ValueError(f"Simulation not found: {simulation_id}")
 
         ipc_client = SimulationIPCClient(sim_dir)
 
         if not ipc_client.check_env_alive():
-            raise ValueError(f"Interview: {simulation_id}")
+            raise ValueError(f"Simulation environment is not running. Agent interviews are only available while the simulation is active.")
 
         logger.info(f"Interview: simulation_id={simulation_id}, count={len(interviews)}, platform={platform}")
 

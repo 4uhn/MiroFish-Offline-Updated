@@ -426,6 +426,10 @@ class GraphToolsService:
         Returns:
             SearchResult
         """
+        if not query or not query.strip():
+            logger.error("Graph search called with empty query — this should be caught upstream. Falling back to local search.")
+            return self._local_search(graph_id, "overview", limit, scope)
+
         logger.info(f"Graph search: graph_id={graph_id}, query={query[:50]}...")
 
         try:
@@ -1148,7 +1152,7 @@ Return the sub-question list in JSON format."""
                         simulation_id=simulation_id,
                         agent_id=agent_id,
                         prompt=combined_question,
-                        timeout=60.0
+                        timeout=120.0
                     )
                     if result.get("success"):
                         raw = result.get("result", "")

@@ -9,6 +9,7 @@ Key insight: Sample action type BEFORE prompting the LLM for content.
 This prevents the LLM's bias toward CREATE_POST.
 """
 
+import re
 import random
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
@@ -630,10 +631,67 @@ def get_speech_profile_for_entity_type(entity_type: str) -> SpeechProfile:
     )
 
 
+def _extract_scenario_context(simulation_requirement: str) -> Dict[str, str]:
+    """Extract location and topic keywords from the simulation requirement text."""
+    text = simulation_requirement
+
+    location = "the local area"
+    loc_patterns = [
+        r'\bin\s+([A-Z][a-z]+(?:(?:\s+(?:upon|on|le|la|de|in)\s+|\s+)[A-Z][a-z]+)*(?:,\s*[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)?)',
+        r'(?:city|town|region|area|borough|county)\s+of\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)',
+        r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s+(?:Water|Council|Hospital|University|School|NHS|Trust|Borough)',
+        r'\bat\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)',
+    ]
+    stop_words = {
+        "The", "This", "That", "These", "Those", "What", "How", "Why", "When",
+        "Where", "Who", "Which", "Each", "Every", "Some", "Any", "All", "Most",
+        "Many", "Several", "Both", "Few", "Other", "Such", "Create", "Simulate",
+        "Generate", "Run", "Start", "Social", "Media", "Public", "Health",
+        "January", "February", "March", "April", "May", "June", "July",
+        "August", "September", "October", "November", "December",
+    }
+    for pattern in loc_patterns:
+        matches = re.findall(pattern, text)
+        for match in matches:
+            if match.split()[0] not in stop_words and len(match) > 2:
+                location = match
+                break
+        if location != "the local area":
+            break
+
+    topic_keywords = []
+    topic_map = {
+        "water": ["water safety", "public health", "local infrastructure"],
+        "contamination": ["contamination", "environmental health", "public safety"],
+        "meningitis": ["meningitis", "public health", "university health"],
+        "outbreak": ["disease outbreak", "public health", "epidemiology"],
+        "flood": ["flooding", "emergency response", "climate"],
+        "fire": ["fire safety", "emergency services", "local news"],
+        "crime": ["crime", "public safety", "law enforcement"],
+        "housing": ["housing", "local planning", "community"],
+        "transport": ["transport", "infrastructure", "commuting"],
+        "school": ["education", "school safety", "local community"],
+        "nhs": ["NHS", "healthcare", "public health"],
+        "vaccine": ["vaccination", "public health", "medical science"],
+        "protest": ["activism", "civil rights", "community organizing"],
+        "pollution": ["pollution", "environment", "public health"],
+    }
+    req_lower = simulation_requirement.lower()
+    for keyword, topics in topic_map.items():
+        if keyword in req_lower:
+            topic_keywords.extend(topics)
+    if not topic_keywords:
+        topic_keywords = ["local news", "current events", "community"]
+    topic_keywords = list(dict.fromkeys(topic_keywords))[:4]
+
+    return {"location": location, "topics": topic_keywords}
+
+
 def generate_synthetic_personas(
     simulation_requirement: str,
     num_institutional_agents: int,
     target_total_agents: int = 15,
+    location: Optional[str] = None,
 ) -> List[Dict]:
     """
     Generate synthetic individual personas to fill the simulation with real people.
@@ -641,12 +699,19 @@ def generate_synthetic_personas(
     Called when the entity extraction only produces institutional agents.
     Analyzes the simulation requirement to determine what demographics should be present.
 
+    Args:
+        location: Location extracted from knowledge graph entities. Falls back to
+                  regex extraction from simulation_requirement if not provided.
+
     Returns a list of persona configs ready for profile generation.
     """
     num_synthetic = target_total_agents - num_institutional_agents
     if num_synthetic <= 0:
         return []
 
+    scenario = _extract_scenario_context(simulation_requirement)
+    if location:
+        scenario["location"] = location
     requirement_lower = simulation_requirement.lower()
 
     # Determine which persona templates are relevant based on the requirement text
@@ -698,11 +763,17 @@ def generate_synthetic_personas(
     for template_name, count in relevant_templates:
         template_pool.extend([template_name] * count)
 
-    # Names pool for generating diverse names
-    first_names = [
-        "Emma", "James", "Priya", "Mohammed", "Sarah", "Tom", "Aisha", "Liam",
-        "Chloe", "Daniel", "Fatima", "Oliver", "Sophie", "Ryan", "Mei", "Jack",
-        "Hannah", "Kwame", "Isla", "Marcus", "Zara", "Ethan", "Nia", "Callum",
+    # Names pool split by gender for consistent name-gender pairing
+    male_first_names = [
+        "James", "Mohammed", "Tom", "Liam", "Daniel", "Oliver", "Ryan",
+        "Jack", "Kwame", "Marcus", "Ethan", "Callum",
+    ]
+    female_first_names = [
+        "Emma", "Priya", "Sarah", "Aisha", "Chloe", "Fatima", "Sophie",
+        "Mei", "Hannah", "Isla", "Zara", "Nia",
+    ]
+    neutral_first_names = [
+        "Alex", "Jordan", "Sam", "Robin", "Casey", "Morgan",
     ]
     last_names = [
         "Smith", "Patel", "Jones", "Williams", "Brown", "Ahmed", "Taylor",
@@ -716,17 +787,24 @@ def generate_synthetic_personas(
         template_name = template_pool[i % len(template_pool)]
         template = PERSONA_TEMPLATES[template_name]
 
+        age = random.randint(*template["age_range"])
+        gender = random.choice(template["gender_pool"])
+
+        if gender == "male":
+            name_pool = male_first_names
+        elif gender == "female":
+            name_pool = female_first_names
+        else:
+            name_pool = neutral_first_names
+
         # Generate a unique name
         while True:
-            fname = random.choice(first_names)
+            fname = random.choice(name_pool)
             lname = random.choice(last_names)
             full_name = f"{fname} {lname}"
             if full_name not in used_names:
                 used_names.add(full_name)
                 break
-
-        age = random.randint(*template["age_range"])
-        gender = random.choice(template["gender_pool"])
 
         persona_config = {
             "name": full_name,
@@ -740,6 +818,8 @@ def generate_synthetic_personas(
             "speech_profile": template["speech_profile"],
             "is_synthetic": True,
             "template": template_name,
+            "location": scenario["location"],
+            "interested_topics": scenario["topics"],
         }
         personas.append(persona_config)
 

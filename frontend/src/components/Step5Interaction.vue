@@ -155,7 +155,7 @@
               <div class="tools-card-avatar">R</div>
               <div class="tools-card-info">
                 <div class="tools-card-name">Report Agent - Chat</div>
-                <div class="tools-card-subtitle">Quick chat version of Report Agent with 4 professional tools, has MiroFish's full memory</div>
+                <div class="tools-card-subtitle">Chat with the Report Agent — 4 analysis tools backed by MiroFish's full knowledge graph</div>
               </div>
               <button class="tools-card-toggle" @click="showToolsDetail = !showToolsDetail">
                 <svg :class="{ 'is-expanded': showToolsDetail }" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
@@ -172,8 +172,8 @@
                     </svg>
                   </div>
                   <div class="tool-content">
-                    <div class="tool-name">InsightForge Deep Attribution</div>
-                    <div class="tool-desc">Aligns real-world seed data with simulation environment state, combines Global/Local Memory mechanisms, provides cross-temporal deep attribution analysis</div>
+                    <div class="tool-name">InsightForge</div>
+                    <div class="tool-desc">Deep attribution analysis — aligns real-world seed data with simulation state using knowledge graph memory for cross-temporal insights</div>
                   </div>
                 </div>
                 <div class="tool-item tool-blue">
@@ -184,8 +184,8 @@
                     </svg>
                   </div>
                   <div class="tool-content">
-                    <div class="tool-name">PanoramaSearch Panoramic Tracking</div>
-                    <div class="tool-desc">Graph-based breadth-first traversal algorithm, reconstructs event propagation paths, captures full information flow topology</div>
+                    <div class="tool-name">PanoramaSearch</div>
+                    <div class="tool-desc">Graph traversal that reconstructs how information propagated through the simulation — maps the full event flow topology</div>
                   </div>
                 </div>
                 <div class="tool-item tool-orange">
@@ -195,8 +195,8 @@
                     </svg>
                   </div>
                   <div class="tool-content">
-                    <div class="tool-name">QuickSearch Fast Retrieval</div>
-                    <div class="tool-desc">GraphRAG-based instant query interface, optimized indexing efficiency, for quickly extracting node attributes and discrete facts</div>
+                    <div class="tool-name">QuickSearch</div>
+                    <div class="tool-desc">Fast GraphRAG retrieval — queries the knowledge graph directly for entity attributes, relationships, and discrete facts</div>
                   </div>
                 </div>
                 <div class="tool-item tool-green">
@@ -208,8 +208,8 @@
                     </svg>
                   </div>
                   <div class="tool-content">
-                    <div class="tool-name">InterviewSubAgent Virtual Interview</div>
-                    <div class="tool-desc">Autonomous interview, capable of parallel multi-turn conversations with individuals in simulated world, collects unstructured perspective data and psychological states</div>
+                    <div class="tool-name">Interview Agents</div>
+                    <div class="tool-desc">Live interviews with simulation agents — parallel multi-turn conversations that collect first-person perspectives and reactions</div>
                   </div>
                 </div>
               </div>
@@ -662,10 +662,12 @@ const sendMessage = async () => {
       await sendToAgent(message)
     }
   } catch (err) {
-    addLog(`Send failed: ${err.message}`)
+    const backendError = err.response?.data?.error
+    const displayError = backendError || err.message
+    addLog(`Send failed: ${displayError}`)
     chatHistory.value.push({
       role: 'assistant',
-      content: `Sorry, an error occurred: ${err.message}`,
+      content: `Sorry, an error occurred: ${displayError}`,
       timestamp: new Date().toISOString()
     })
   } finally {
@@ -756,9 +758,29 @@ const sendToAgent = async (message) => {
     }
 
     if (responseContent) {
+      // Strip tool-call JSON wrappers if the backend didn't catch them
+      let cleanContent = responseContent
+      if (typeof cleanContent === 'string' && cleanContent.trim().startsWith('{')) {
+        try {
+          const parsed = JSON.parse(cleanContent)
+          if (parsed.arguments && parsed.arguments.content) {
+            cleanContent = parsed.arguments.content
+          } else if (parsed.content) {
+            cleanContent = parsed.content
+          }
+        } catch { /* not JSON, use as-is */ }
+      } else if (typeof cleanContent === 'object' && cleanContent !== null) {
+        if (cleanContent.arguments && cleanContent.arguments.content) {
+          cleanContent = cleanContent.arguments.content
+        } else if (cleanContent.content) {
+          cleanContent = cleanContent.content
+        } else {
+          cleanContent = JSON.stringify(cleanContent)
+        }
+      }
       chatHistory.value.push({
         role: 'assistant',
-        content: responseContent,
+        content: cleanContent,
         timestamp: new Date().toISOString()
       })
       addLog(`${selectedAgent.value.username} replied`)

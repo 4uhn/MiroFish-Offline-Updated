@@ -259,12 +259,17 @@ class SimulationManager:
                 filtered.entities = filtered.entities[:max_institutional]
                 filtered.filtered_count = len(filtered.entities)
 
+            # Extract location from knowledge graph entities
+            graph_locations = reader.get_location_names(state.graph_id)
+            scenario_location = graph_locations[0] if graph_locations else None
+
             # Generate synthetic individual personas (students, parents, residents)
             # to fill the simulation with real people, not just institutions
             synthetic_personas = generate_synthetic_personas(
                 simulation_requirement=simulation_requirement,
                 num_institutional_agents=len(filtered.entities),
                 target_total_agents=MAX_AGENT_ENTITIES,
+                location=scenario_location,
             )
             if synthetic_personas:
                 logger.info(f"Generated {len(synthetic_personas)} synthetic personas")
@@ -337,9 +342,11 @@ class SimulationManager:
                 for sp in synthetic_personas:
                     speech = sp['speech_profile']
                     emotional = EmotionalState(sp['emotional_state'])
+                    location = sp.get('location', 'the local area')
+                    topics = sp.get('interested_topics', ['local news', 'current events', 'community'])
                     persona_text = (
                         f"{sp['name']} is a {sp['age']}-year-old {sp['gender']} {sp['role']} "
-                        f"in Canterbury, Kent. Stance: {sp['stance']}. "
+                        f"in {location}. Stance: {sp['stance']}. "
                         f"\n\n--- BEHAVIORAL INSTRUCTIONS ---\n"
                         f"{build_agent_system_prompt(speech, emotional, is_institutional=False, confirmation_bias=sp.get('susceptible_to_misinfo', False))}"
                     )
@@ -347,14 +354,14 @@ class SimulationManager:
                         user_id=next_id,
                         user_name=sp['name'].lower().replace(' ', '_') + f"_{random.randint(100,999)}",
                         name=sp['name'],
-                        bio=f"{sp['role'].title()}, {sp['age']}, Canterbury",
+                        bio=f"{sp['role'].title()}, {sp['age']}, {location}",
                         persona=persona_text,
                         age=sp['age'],
                         gender=sp['gender'],
                         mbti=random.choice(["ENFP", "INFP", "ISTP", "ESFJ", "INTP", "ENFJ", "ISTJ", "ESTP"]),
                         country="United Kingdom",
                         profession=sp['role'],
-                        interested_topics=["health", "local news", "university life"],
+                        interested_topics=topics,
                         karma=random.randint(100, 3000),
                         source_entity_type=sp.get('template', 'synthetic'),
                     )
@@ -363,11 +370,11 @@ class SimulationManager:
                 logger.info(f"Added {len(synthetic_personas)} synthetic persona profiles")
 
             # Enrich institutional profiles with speech/behavioral instructions
+            # Skip any profile that already has behavioral instructions (synthetic personas)
             for profile in profiles:
-                if profile.source_entity_type and profile.source_entity_type not in (
-                    'synthetic', 'anxious_student', 'calm_student', 'angry_parent',
-                    'worried_parent', 'local_resident', 'skeptic_resident', 'journalist'
-                ):
+                if "--- BEHAVIORAL INSTRUCTIONS ---" in (profile.persona or ""):
+                    continue
+                if profile.source_entity_type:
                     speech = get_speech_profile_for_entity_type(profile.source_entity_type or 'Organization')
                     behavioral_suffix = (
                         f"\n\n--- BEHAVIORAL INSTRUCTIONS ---\n"

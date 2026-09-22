@@ -987,7 +987,10 @@ class ReportAgent:
 
         try:
             if tool_name == "insight_forge":
-                query = parameters.get("query", "")
+                query = parameters.get("query", "") or ""
+                if not query.strip():
+                    query = self.simulation_requirement
+                    logger.info(f"Empty query for insight_forge, using simulation_requirement: {query[:60]}")
                 ctx = parameters.get("report_context", "") or report_context
                 result = self.graph_tools.insight_forge(
                     graph_id=self.graph_id,
@@ -996,10 +999,12 @@ class ReportAgent:
                     report_context=ctx
                 )
                 return result.to_text()
-            
+
             elif tool_name == "panorama_search":
-                # Broad search - get full panoramic view
-                query = parameters.get("query", "")
+                query = parameters.get("query", "") or ""
+                if not query.strip():
+                    query = self.simulation_requirement
+                    logger.info(f"Empty query for panorama_search, using simulation_requirement: {query[:60]}")
                 include_expired = parameters.get("include_expired", True)
                 if isinstance(include_expired, str):
                     include_expired = include_expired.lower() in ['true', '1', 'yes']
@@ -1009,10 +1014,12 @@ class ReportAgent:
                     include_expired=include_expired
                 )
                 return result.to_text()
-            
+
             elif tool_name == "quick_search":
-                # Simple search - quick retrieval
-                query = parameters.get("query", "")
+                query = parameters.get("query", "") or ""
+                if not query.strip():
+                    query = self.simulation_requirement
+                    logger.info(f"Empty query for quick_search, using simulation_requirement: {query[:60]}")
                 limit = parameters.get("limit", 10)
                 if isinstance(limit, str):
                     limit = int(limit)

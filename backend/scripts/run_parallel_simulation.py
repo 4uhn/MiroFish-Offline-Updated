@@ -122,6 +122,14 @@ except ImportError as e:
     print(": pip install oasis-ai camel-ai")
     sys.exit(1)
 
+# Monkey-patch SocialAction methods to tolerate extra kwargs from LLM tool calls
+# (e.g. create_comment receives created_at which it doesn't accept)
+from oasis.social_agent.agent_action import SocialAction
+_orig_create_comment = SocialAction.create_comment
+async def _create_comment_compat(self, post_id: int, content: str, **_kwargs):
+    return await _orig_create_comment(self, post_id, content)
+SocialAction.create_comment = _create_comment_compat
+
 sys.path.insert(0, os.path.join(_backend_dir, 'app', 'services'))
 from system_one_router import (
     route_agent_action,
@@ -131,6 +139,19 @@ from system_one_router import (
 )
 from agent_memory import AgentMemoryStore
 from response_pool import ResponsePool
+
+# Embedding service for Response Pool v2 semantic matching
+_pool_embedder = None
+try:
+    from app.storage.embedding_service import EmbeddingService
+    _pool_embedder = EmbeddingService()
+    if _pool_embedder.health_check():
+        print("Response pool v2: semantic matching enabled (nomic-embed-text)")
+    else:
+        _pool_embedder = None
+        print("Response pool: embedding unavailable, using archetype-only matching")
+except Exception as e:
+    print(f"Response pool: semantic matching unavailable ({e}), using archetype-only matching")
 
 TWITTER_ACTIONS = [
     ActionType.CREATE_POST,
@@ -424,23 +445,42 @@ class ParallelIPCHandler:
             self.send_response(command_id, "failed", error="")
             return False
     
+    @staticmethod
+    def _extract_content_from_response(response):
+        if not response:
+            return response
+        if isinstance(response, str):
+            try:
+                parsed = json.loads(response)
+                response = parsed
+            except (json.JSONDecodeError, TypeError):
+                return response
+        if isinstance(response, dict):
+            if "arguments" in response and isinstance(response["arguments"], dict):
+                return response["arguments"].get("content", response["arguments"].get("text", str(response["arguments"])))
+            if "content" in response:
+                return response["content"]
+            if "response" in response:
+                return response["response"]
+        return response
+
     def _get_interview_result(self, agent_id: int, platform: str) -> Dict[str, Any]:
         """"""
         db_path = os.path.join(self.simulation_dir, f"{platform}_simulation.db")
-        
+
         result = {
             "agent_id": agent_id,
             "response": None,
             "timestamp": None
         }
-        
+
         if not os.path.exists(db_path):
             return result
-        
+
         try:
             conn = sqlite3.connect(db_path)
             cursor = conn.cursor()
-            
+
 
             cursor.execute("""
                 SELECT user_id, info, created_at
@@ -449,22 +489,23 @@ class ParallelIPCHandler:
                 ORDER BY created_at DESC
                 LIMIT 1
             """, (ActionType.INTERVIEW.value, agent_id))
-            
+
             row = cursor.fetchone()
             if row:
                 user_id, info_json, created_at = row
                 try:
                     info = json.loads(info_json) if info_json else {}
-                    result["response"] = info.get("response", info)
+                    raw_response = info.get("response", info)
+                    result["response"] = self._extract_content_from_response(raw_response)
                     result["timestamp"] = created_at
                 except json.JSONDecodeError:
                     result["response"] = info_json
-            
+
             conn.close()
-            
+
         except Exception as e:
             print(f"  Interview: {e}")
-        
+
         return result
     
     async def process_commands(self) -> bool:
@@ -534,14 +575,55 @@ def get_agent_names_from_config(config: Dict[str, Any]) -> Dict[int, str]:
     """"""
     agent_names = {}
     agent_configs = config.get("agent_configs", [])
-    
+
     for agent_config in agent_configs:
         agent_id = agent_config.get("agent_id")
         entity_name = agent_config.get("entity_name", f"Agent_{agent_id}")
         if agent_id is not None:
             agent_names[agent_id] = entity_name
-    
+
     return agent_names
+
+def build_topics_lookup(config: Dict[str, Any]) -> Dict[int, str]:
+    """Build agent_id -> joined topics string for semantic pool matching."""
+    lookup = {}
+    for cfg in config.get("agent_configs", []):
+        agent_id = cfg.get("agent_id")
+        topics = cfg.get("interested_topics", [])
+        if agent_id is not None and topics:
+            lookup[agent_id] = " ".join(topics)
+    return lookup
+
+
+_MEMORY_MARKER = "YOUR RECENT ACTIVITY"
+
+
+def _inject_memory_summary(agent, summary: str):
+    """Replace (not stack) the memory summary in a CAMEL agent's chat history.
+
+    Removes any previous summary record before adding the new one,
+    preventing unbounded context growth across simulation rounds.
+    """
+    from camel.messages import BaseMessage
+    from camel.types import OpenAIBackendRole
+
+    try:
+        mem_list = agent.memory._chat_history_block.storage.memory_list
+        mem_list[:] = [
+            r for r in mem_list
+            if not (
+                r.get("role_at_backend") == "system"
+                and r.get("message", {}).get("content", "").startswith(_MEMORY_MARKER)
+            )
+        ]
+    except (AttributeError, TypeError):
+        pass
+
+    agent.update_memory(
+        message=BaseMessage.make_user_message(role_name="System", content=summary),
+        role=OpenAIBackendRole.SYSTEM,
+    )
+
 
 def fetch_new_actions_from_db(
     db_path: str,
@@ -1074,8 +1156,9 @@ async def run_twitter_simulation(
 
     memory_db = os.path.join(simulation_dir, "twitter_agent_memory.db")
     memory_store = AgentMemoryStore(db_path=memory_db)
-    response_pool = ResponsePool(reuse_probability=0.3)
+    response_pool = ResponsePool(reuse_probability=0.3, embedding_service=_pool_embedder)
     pool_reused = 0
+    topics_lookup = build_topics_lookup(config)
 
     for round_num in range(total_rounds):
         if _shutdown_event and _shutdown_event.is_set():
@@ -1118,7 +1201,8 @@ async def run_twitter_simulation(
             )
             if isinstance(action, LLMAction):
                 # Try to reuse a pooled response before spending an LLM call
-                reused_text = response_pool.try_reuse(archetype)
+                topic_query = topics_lookup.get(agent_id)
+                reused_text = response_pool.try_reuse(archetype, query=topic_query)
                 if reused_text:
                     actions[agent] = ManualAction(
                         action_type=ActionType.CREATE_POST,
@@ -1136,14 +1220,7 @@ async def run_twitter_simulation(
                     s2_calls += 1
                     summary = memory_store.get_summary(agent_id)
                     if summary:
-                        from camel.messages import BaseMessage
-                        from camel.types import OpenAIBackendRole
-                        agent.update_memory(
-                            message=BaseMessage.make_user_message(
-                                role_name="System", content=summary
-                            ),
-                            role=OpenAIBackendRole.SYSTEM,
-                        )
+                        _inject_memory_summary(agent, summary)
             else:
                 actions[agent] = action
                 s1_skipped += 1
@@ -1226,7 +1303,7 @@ async def run_twitter_simulation(
     log_info(
         f"Twitter done: {elapsed:.1f}s, {total_actions} actions, "
         f"System One: {s1_skipped}/{total_decisions} ({s1_pct:.0f}%) decisions skipped LLM, "
-        f"pool reused: {pool_reused} posts, "
+        f"pool: reused={pool_reused}, deduped={pool_stats['deduped']}, semantic={pool_stats['semantic_matches']}, "
         f"memory: {memory_store.total_records()} records for {memory_store.agent_count()} agents"
     )
 
@@ -1368,8 +1445,9 @@ async def run_reddit_simulation(
 
     memory_db = os.path.join(simulation_dir, "reddit_agent_memory.db")
     reddit_memory_store = AgentMemoryStore(db_path=memory_db)
-    reddit_response_pool = ResponsePool(reuse_probability=0.3)
+    reddit_response_pool = ResponsePool(reuse_probability=0.3, embedding_service=_pool_embedder)
     reddit_pool_reused = 0
+    reddit_topics_lookup = build_topics_lookup(config)
 
     for round_num in range(total_rounds):
         if _shutdown_event and _shutdown_event.is_set():
@@ -1411,7 +1489,8 @@ async def run_reddit_simulation(
                 agent_graph=result.agent_graph,
             )
             if isinstance(action, LLMAction):
-                reused_text = reddit_response_pool.try_reuse(archetype)
+                topic_query = reddit_topics_lookup.get(agent_id)
+                reused_text = reddit_response_pool.try_reuse(archetype, query=topic_query)
                 if reused_text:
                     actions[agent] = ManualAction(
                         action_type=ActionType.CREATE_POST,
@@ -1429,14 +1508,7 @@ async def run_reddit_simulation(
                     s2_calls += 1
                     summary = reddit_memory_store.get_summary(agent_id)
                     if summary:
-                        from camel.messages import BaseMessage
-                        from camel.types import OpenAIBackendRole
-                        agent.update_memory(
-                            message=BaseMessage.make_user_message(
-                                role_name="System", content=summary
-                            ),
-                            role=OpenAIBackendRole.SYSTEM,
-                        )
+                        _inject_memory_summary(agent, summary)
             else:
                 actions[agent] = action
                 s1_skipped += 1
@@ -1514,10 +1586,11 @@ async def run_reddit_simulation(
     elapsed = (datetime.now() - start_time).total_seconds()
     total_decisions = s1_skipped + s2_calls
     s1_pct = (s1_skipped / max(total_decisions, 1)) * 100
+    reddit_pool_stats = reddit_response_pool.stats
     log_info(
         f"Reddit done: {elapsed:.1f}s, {total_actions} actions, "
         f"System One: {s1_skipped}/{total_decisions} ({s1_pct:.0f}%) decisions skipped LLM, "
-        f"pool reused: {reddit_pool_reused} posts, "
+        f"pool: reused={reddit_pool_reused}, deduped={reddit_pool_stats['deduped']}, semantic={reddit_pool_stats['semantic_matches']}, "
         f"memory: {reddit_memory_store.total_records()} records for {reddit_memory_store.agent_count()} agents"
     )
 

@@ -154,6 +154,22 @@ class EntityReader:
         logger.info(f"{len(nodes)} ")
         return nodes
 
+    def get_location_names(self, graph_id: str) -> List[str]:
+        """Extract location/place entity names from the graph for scenario context."""
+        location_types = {"location", "place", "city", "region", "area", "district", "country"}
+        all_nodes = self.get_all_nodes(graph_id)
+        locations = []
+        for node in all_nodes:
+            labels = node.get("labels", [])
+            custom_labels = [la for la in labels if la not in ["Entity", "Node"]]
+            for label in custom_labels:
+                if label.lower() in location_types:
+                    name = node.get("name", "").strip()
+                    if name and len(name) > 2 and not self._is_garbage_entity_name(name):
+                        locations.append(name)
+                    break
+        return locations
+
     def get_all_edges(self, graph_id: str) -> List[Dict[str, Any]]:
         """"""
         logger.info(f"{graph_id} ...")

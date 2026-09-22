@@ -155,7 +155,7 @@ class SimulationIPCClient:
         agent_id: int,
         prompt: str,
         platform: str = None,
-        timeout: float = 60.0
+        timeout: float = 120.0
     ) -> IPCResponse:
         """"""
         args = {

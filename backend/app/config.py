@@ -45,6 +45,9 @@ class Config:
 
     LLM_API_KEY, LLM_BASE_URL, LLM_MODEL_NAME = _resolve_llm_config.__func__()
 
+    # Tiered model routing — fast model for extraction tasks (NER, classification)
+    LLM_FAST_MODEL_NAME = os.environ.get('LLM_FAST_MODEL_NAME', '').strip()
+
     # Propagate resolved values into env so CAMEL-AI / simulation scripts inherit them
     os.environ.setdefault('LLM_API_KEY', LLM_API_KEY or '')
     os.environ.setdefault('LLM_BASE_URL', LLM_BASE_URL or '')

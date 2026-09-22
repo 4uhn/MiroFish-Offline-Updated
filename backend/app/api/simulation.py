@@ -1607,6 +1607,48 @@ def get_simulation_comments(simulation_id: str):
 
 # ============== Interview ==============
 
+@simulation_bp.route('/interview/batch', methods=['POST'])
+def interview_agents_batch():
+    try:
+        data = request.get_json() or {}
+        simulation_id = data.get('simulation_id')
+        interviews = data.get('interviews', [])
+        platform = data.get('platform')
+        timeout = data.get('timeout', 120)
+
+        if not simulation_id:
+            return jsonify({"success": False, "error": "simulation_id is required"}), 400
+
+        if not interviews:
+            return jsonify({"success": False, "error": "interviews list is required"}), 400
+
+        result = SimulationRunner.interview_agents_batch(
+            simulation_id=simulation_id,
+            interviews=interviews,
+            platform=platform,
+            timeout=timeout
+        )
+
+        return jsonify({
+            "success": result.get("success", False),
+            "data": result
+        })
+
+    except ValueError as e:
+        return jsonify({"success": False, "error": str(e)}), 400
+
+    except TimeoutError as e:
+        return jsonify({"success": False, "error": f"Interview timed out: {str(e)}"}), 504
+
+    except Exception as e:
+        logger.error(f"Failed to batch interview: {e}")
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
+
+
 @simulation_bp.route('/interview', methods=['POST'])
 def interview_agent():
     try:

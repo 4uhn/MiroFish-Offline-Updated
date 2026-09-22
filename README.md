@@ -1,8 +1,6 @@
 <div align="center">
 
-<img src="./static/image/mirofish-offline-banner.png" alt="MiroFish Offline" width="100%"/>
-
-# MiroFish-Offline
+# MiroFish-Offline (Updated)
 
 **Fully local multi-agent simulation engine — no cloud APIs required.**
 
@@ -18,7 +16,7 @@ MiroFish is a multi-agent simulation engine: upload any document (press release,
 
 This fork makes it **fully local and fully English**, optimized for Apple Silicon (M2 Pro 16GB tested):
 
-| Feature | Original MiroFish | MiroFish-Offline |
+| Feature | Original MiroFish | This Fork |
 |---|---|---|
 | Language | Chinese UI | **English UI** (1,000+ strings translated) |
 | Graph DB | Zep Cloud | **Neo4j CE 5.18** |
@@ -28,7 +26,9 @@ This fork makes it **fully local and fully English**, optimized for Apple Silico
 | Action routing | Every action = LLM call | **System One** (60-70% skip LLM) |
 | Agent behavior | Uniform | **4 archetypes** (Lurker, Amplifier, Contributor, Debater) |
 | Agent memory | Stateless | **Action journal** with SQLite persistence |
-| Response sharing | None | **TopoSim-inspired** archetype pooling |
+| Model routing | Single model | **Tiered** (fast 0.6b for NER, 8b for generation) |
+| Response sharing | None | **Semantic pool** (embedding-matched cross-archetype reuse) |
+| KV cache | Default f16 | **Q8 quantized** (halves memory, negligible quality loss) |
 
 ## How it works
 
@@ -63,7 +63,7 @@ This fork makes it **fully local and fully English**, optimized for Apple Silico
 │  │  └─────┬─────┘  └───────┬────────┘  │        │
 │  │        │                │            │        │
 │  │   ManualAction     ManualAction      │        │
-│  │   (instant)        (from pool)       │        │
+│  │   (instant)        (semantic match)  │        │
 │  │        │                │            │        │
 │  │        └────────┬───────┘            │        │
 │  │                 │                    │        │
@@ -71,6 +71,7 @@ This fork makes it **fully local and fully English**, optimized for Apple Silico
 │  │            (Ollama)                  │        │
 │  └─────────────────────────────────────┘        │
 │  Agent Memory Store (SQLite)                     │
+│  Tiered Model Router (0.6b→NER, 8b→generation)  │
 └──────────────────┬──────────────────────────────┘
                    │
             ┌──────▼──────┐
@@ -89,8 +90,8 @@ This fork makes it **fully local and fully English**, optimized for Apple Silico
 ### Option A: Docker
 
 ```bash
-git clone https://github.com/44jch/MiroFish-Offline.git
-cd MiroFish-Offline
+git clone https://github.com/4uhn/MiroFish-Offline-Updated.git
+cd MiroFish-Offline-Updated
 cp .env.example .env
 
 docker compose up -d
@@ -163,6 +164,15 @@ EMBEDDING_MODEL=nomic-embed-text
 EMBEDDING_BASE_URL=http://localhost:11434
 ```
 
+**Optional: Tiered model routing** (speeds up graph building ~5x):
+
+```bash
+ollama pull qwen3:0.6b
+# Then in .env:
+LLM_FAST_MODEL_NAME=qwen3:0.6b
+LLM_FAST_NUM_CTX=2048
+```
+
 Works with any OpenAI-compatible API — swap Ollama for any other provider by changing `LLM_BASE_URL` and `LLM_API_KEY`.
 
 ## LLM Call Reduction
@@ -172,8 +182,9 @@ The key optimization for local hardware. Three layers stack:
 | Layer | What it does | Savings |
 |---|---|---|
 | **System One Router** | Non-text actions (like, follow, repost) resolved instantly via archetype-weighted sampling | ~60-70% of all decisions |
-| **Response Pool** | CREATE_POST reused from same-archetype agent with text variation (synonym swap, sentence reorder) | ~30% of remaining text actions |
-| **Agent Memory** | Tracks all actions; injects summary before LLM calls so agents stay contextually grounded | Better output quality |
+| **Tiered Model Router** | NER/extraction tasks routed to qwen3:0.6b (~5x faster); text generation stays on qwen3:8b | ~5x faster graph building |
+| **Semantic Response Pool** | CREATE_POST reused cross-archetype via nomic-embed-text similarity matching, with text variation | ~30% of remaining text actions |
+| **Agent Memory** | Tracks all actions; replaces summary each round (no stacking) so agents stay contextually grounded | Better output quality |
 
 Net result: **~75-80% of all agent decisions avoid LLM calls entirely.**
 
@@ -188,6 +199,17 @@ Each agent is assigned one of four archetypes that control their action distribu
 | **Contributor** | 25% | 20% | 10% | 10% | 35% |
 | **Debater** | 30% | 10% | 5% | 15% | 40% |
 
+### Inference Optimization
+
+Additional optimizations for memory-constrained hardware (16GB):
+
+| Technique | Effect |
+|---|---|
+| **KV Cache Q8** (`OLLAMA_KV_CACHE_TYPE=q8_0`) | Halves KV cache memory with negligible quality loss |
+| **Context window 2048** (`OLLAMA_NUM_CTX=2048`) | Sufficient for social media posts, saves ~4x memory vs 8192 |
+| **Parallel requests 3** (`OLLAMA_NUM_PARALLEL=3`) | Balances throughput vs memory on 16GB |
+| **Keep alive** (`OLLAMA_KEEP_ALIVE=-1`) | Model stays loaded, avoids reload latency between rounds |
+
 ## Hardware Requirements
 
 | Component | Minimum (qwen3:8b) | Recommended |
@@ -198,6 +220,21 @@ Each agent is assigned one of four archetypes that control their action distribu
 | CPU | 4 cores | 8+ cores |
 
 Tested on: M2 Pro 16GB (MacBook Pro). CPU-only mode works but is slower.
+
+## Tools
+
+```bash
+# Benchmark LLM throughput, embedding speed, pool efficiency
+python backend/scripts/benchmark.py
+python backend/scripts/benchmark.py --skip-embedding -o bench.json
+
+# Export a completed simulation as structured JSON
+python backend/scripts/export_simulation.py backend/uploads/simulations/<sim_id>
+python backend/scripts/export_simulation.py <sim_dir> --pretty --no-posts
+
+# Test LLM readiness before running a simulation
+python backend/scripts/test_llm_readiness.py
+```
 
 ## Use Cases
 
@@ -212,6 +249,10 @@ AGPL-3.0 — same as the original MiroFish project. See [LICENSE](./LICENSE).
 
 ## Credits
 
-Fork of [MiroFish](https://github.com/666ghj/MiroFish) by [666ghj](https://github.com/666ghj). Simulation engine powered by [OASIS](https://github.com/camel-ai/oasis) (CAMEL-AI).
+This project builds on the work of several open-source projects:
 
-**This fork adds:** full English translation, local-only operation (Neo4j CE + Ollama), System One action routing, behavioral archetypes, agent memory persistence, TopoSim-inspired response pooling, and ontology generation improvements.
+- **[MiroFish](https://github.com/666ghj/MiroFish)** by [666ghj](https://github.com/666ghj) — the original multi-agent simulation engine
+- **[MiroFish-Offline](https://github.com/nikmcfly/MiroFish-Offline)** by [nikmcfly](https://github.com/nikmcfly) — the English fork with local-only stack that this project is based on
+- **[OASIS](https://github.com/camel-ai/oasis)** (CAMEL-AI) — the underlying simulation engine
+
+**This fork adds:** System One action routing (inspired by [TypeSafe/Jev](https://github.com/jevhub)), tiered model routing, behavioral archetypes, agent memory persistence, semantic response pooling (nomic-embed-text), benchmarking suite, simulation export, KV cache optimization, and inference tuning for Apple Silicon.

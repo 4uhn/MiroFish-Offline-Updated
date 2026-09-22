@@ -69,6 +69,9 @@ backend/venv311/
 # Synthetic persona output (regenerated each run)
 synthetic_personas.json
 
+# Internal planning doc
+ROADMAP.md
+
 # OASIS runtime
 *.db-journal
 *.db-wal
