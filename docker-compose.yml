@@ -1,14 +1,15 @@
 services:
   mirofish:
     build: .
-    # Or use pre-built image (when available):
-    # image: ghcr.io/nikmcfly/mirofish-offline:latest
     container_name: mirofish-offline
     env_file:
       - .env
+    environment:
+      - FLASK_HOST=0.0.0.0
+      - VITE_HOST=0.0.0.0
     ports:
-      - "3000:3000"
-      - "5001:5001"
+      - "127.0.0.1:3000:3000"
+      - "127.0.0.1:5001:5001"
     restart: unless-stopped
     volumes:
       - ./backend/uploads:/app/backend/uploads
@@ -22,8 +23,8 @@ services:
     image: neo4j:5.18-community
     container_name: mirofish-neo4j
     ports:
-      - "7474:7474"   # Neo4j Browser
-      - "7687:7687"   # Bolt protocol
+      - "127.0.0.1:7474:7474"   # Neo4j Browser
+      - "127.0.0.1:7687:7687"   # Bolt protocol
     environment:
       - NEO4J_AUTH=${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:-mirofish}
       - NEO4J_PLUGINS=["apoc"]
@@ -44,7 +45,14 @@ services:
     image: ollama/ollama:latest
     container_name: mirofish-ollama
     ports:
-      - "11434:11434"
+      - "127.0.0.1:11434:11434"
+    # The backend budgets for an 8192-token window (OLLAMA_NUM_CTX) and 3 parallel slots
+    environment:
+      - OLLAMA_CONTEXT_LENGTH=8192
+      - OLLAMA_NUM_PARALLEL=3
+      - OLLAMA_KV_CACHE_TYPE=q8_0
+      - OLLAMA_FLASH_ATTENTION=1
+      - OLLAMA_KEEP_ALIVE=-1
     volumes:
       - ollama_data:/root/.ollama
     restart: unless-stopped

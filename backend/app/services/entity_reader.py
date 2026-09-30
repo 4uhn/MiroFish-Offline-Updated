@@ -1,16 +1,23 @@
-""""""
+"""
+Entity reading and filtering service.
+Reads nodes from Neo4j graph, filters out meaningful entity type nodes.
+
+Replaces zep_entity_reader.py — all Zep Cloud calls replaced by GraphStorage.
+"""
 
 from typing import Dict, Any, List, Optional, Set
 from dataclasses import dataclass, field
 
 from ..utils.logger import get_logger
+from ..utils.entity_names import is_mentioned, name_tokens, same_entity
 from ..storage import GraphStorage
+from ..storage.graph_storage import SEED_ONLY, in_run_scope
 
 logger = get_logger('mirofish.entity_reader')
 
 @dataclass
 class EntityNode:
-    """"""
+    """Entity node data structure"""
     uuid: str
     name: str
     labels: List[str]
@@ -33,7 +40,7 @@ class EntityNode:
         }
 
     def get_entity_type(self) -> Optional[str]:
-        """"""
+        """Get entity type (exclude default Entity label)"""
         for label in self.labels:
             if label not in ["Entity", "Node"]:
                 return label
@@ -41,7 +48,7 @@ class EntityNode:
 
 @dataclass
 class FilteredEntities:
-    """"""
+    """Filtered entity set"""
     entities: List[EntityNode]
     entity_types: Set[str]
     total_count: int
@@ -54,6 +61,112 @@ class FilteredEntities:
             "total_count": self.total_count,
             "filtered_count": self.filtered_count,
         }
+
+def _type_mentioned(entity_type: Optional[str], text: str) -> bool:
+    """True when text names the entity's type as a kind of actor
+    ("local campaigners" for EnvironmentalCampaigner)."""
+    type_tokens = name_tokens(entity_type or "")
+    if not type_tokens:
+        return False
+    head = type_tokens[-1]
+    return any(w == head or w.rstrip("s") == head for w in name_tokens(text))
+
+
+def select_agent_entities(
+    entities: List[EntityNode], cap: int, requirement: Optional[str] = None
+) -> List[EntityNode]:
+    """Choose which graph entities become institutional agents.
+
+    Aliases ("NHS Bristol ICB" / "NHS Bristol, North Somerset and South
+    Gloucestershire ICB") are merged into the best-connected name, and their
+    edges are pooled. Groups are then ranked by degree, taking the
+    best-connected entity of each type first so that one heavily discussed
+    type cannot crowd out the others. The remaining slots go by degree.
+
+    Replaces a plain entities[:cap], whose graph-read order dropped the two
+    hubs in Run 8 (Environment Agency, 64 edges; Bristol Water, 61) and
+    included NHS ICB twice under different names.
+
+    When the simulation requirement is given, entities it names (under any
+    alias) are chosen first, then one entity for each actor type it names.
+    """
+    groups: List[List[EntityNode]] = []
+    for entity in sorted(entities, key=lambda e: len(e.related_edges), reverse=True):
+        for group in groups:
+            if same_entity(entity.name, group[0].name):
+                group.append(entity)
+                break
+        else:
+            groups.append([entity])
+
+    merged: List[EntityNode] = []
+    names: Dict[int, List[str]] = {}
+    for group in groups:
+        head = group[0]
+        names[id(head)] = [e.name for e in group]
+        if len(group) > 1:
+            seen = {(e.get("edge_name"), e.get("fact")) for e in head.related_edges}
+            for alias in group[1:]:
+                for edge in alias.related_edges:
+                    key = (edge.get("edge_name"), edge.get("fact"))
+                    if key not in seen:
+                        seen.add(key)
+                        head.related_edges.append(edge)
+            logger.info(
+                f"Merged entity aliases into '{head.name}': "
+                f"{[a.name for a in group[1:]]}"
+            )
+        merged.append(head)
+
+    ranked = sorted(merged, key=lambda e: len(e.related_edges), reverse=True)
+    chosen: List[EntityNode] = []
+    seen_types: Set[str] = set()
+
+    # Entities the user's prompt names come first. In Run 10 the prompt listed
+    # the Environment Agency, NHS Bristol and the local campaigners, and
+    # degree ranking dropped all three.
+    if requirement:
+        named = [e for e in ranked if any(is_mentioned(n, requirement) for n in names[id(e)])]
+        # "NHS" and "NHS Bristol" both match "NHS Bristol": keep the more specific one
+        token_lists = {id(e): name_tokens(e.name) for e in named}
+        named = [
+            e for e in named
+            if not any(
+                o is not e and len(token_lists[id(o)]) > len(token_lists[id(e)])
+                and token_lists[id(o)][:len(token_lists[id(e)])] == token_lists[id(e)]
+                for o in named
+            )
+        ]
+        type_named = [
+            e for e in ranked
+            if e not in named and _type_mentioned(e.get_entity_type(), requirement)
+        ]
+        for entity in named + type_named:
+            etype = entity.get_entity_type() or "Entity"
+            # A type the prompt names only as a type gets one agent
+            if entity in type_named and etype in seen_types:
+                continue
+            if len(chosen) < cap:
+                chosen.append(entity)
+                seen_types.add(etype)
+        if chosen:
+            logger.info(f"Named in the simulation requirement: {[e.name for e in chosen]}")
+
+    for entity in ranked:
+        if entity in chosen:
+            continue
+        etype = entity.get_entity_type() or "Entity"
+        if etype not in seen_types and len(chosen) < cap:
+            chosen.append(entity)
+            seen_types.add(etype)
+    for entity in ranked:
+        if len(chosen) >= cap:
+            break
+        if entity not in chosen:
+            chosen.append(entity)
+
+    return sorted(chosen, key=lambda e: len(e.related_edges), reverse=True)
+
 
 # Entity types that represent locations, objects, or abstract concepts — NOT social media agents.
 # These are excluded from simulation agent generation even if the ontology includes them.
@@ -148,10 +261,9 @@ class EntityReader:
         return False
 
     def get_all_nodes(self, graph_id: str) -> List[Dict[str, Any]]:
-        """"""
-        logger.info(f"{graph_id} ...")
+        logger.info(f"Getting all nodes in graph {graph_id}...")
         nodes = self.storage.get_all_nodes(graph_id)
-        logger.info(f"{len(nodes)} ")
+        logger.info(f"Got {len(nodes)} nodes total")
         return nodes
 
     def get_location_names(self, graph_id: str) -> List[str]:
@@ -170,19 +282,21 @@ class EntityReader:
                     break
         return locations
 
+    # Agents are prepared from the seed document alone. On a reused graph,
+    # earlier runs' agent claims ("Bristol City Council collaborates with the
+    # Environment Agency") would otherwise become entity context for profiles.
+
     def get_all_edges(self, graph_id: str) -> List[Dict[str, Any]]:
-        """"""
-        logger.info(f"{graph_id} ...")
-        edges = self.storage.get_all_edges(graph_id)
-        logger.info(f"{len(edges)} ")
+        logger.info(f"Getting all edges in graph {graph_id}...")
+        edges = [e for e in self.storage.get_all_edges(graph_id) if in_run_scope(e, SEED_ONLY)]
+        logger.info(f"Got {len(edges)} seed edges")
         return edges
 
     def get_node_edges(self, node_uuid: str) -> List[Dict[str, Any]]:
-        """"""
         try:
-            return self.storage.get_node_edges(node_uuid)
+            return [e for e in self.storage.get_node_edges(node_uuid) if in_run_scope(e, SEED_ONLY)]
         except Exception as e:
-            logger.warning(f"{node_uuid} : {str(e)}")
+            logger.warning(f"Failed to get edges for node {node_uuid}: {str(e)}")
             return []
 
     def filter_defined_entities(
@@ -191,8 +305,7 @@ class EntityReader:
         defined_entity_types: Optional[List[str]] = None,
         enrich_with_edges: bool = True
     ) -> FilteredEntities:
-        """"""
-        logger.info(f"{graph_id} ...")
+        logger.info(f"Starting to filter entities in graph {graph_id}...")
 
         all_nodes = self.get_all_nodes(graph_id)
         total_count = len(all_nodes)
@@ -212,6 +325,14 @@ class EntityReader:
             custom_labels = [la for la in labels if la not in ["Entity", "Node"]]
 
             if not custom_labels:
+                continue
+
+            # Agents come from the seed document. Entities first named in an
+            # earlier run's agent posts (synthetic residents, Run 10's invented
+            # "River Wye") stay in the graph for the report but must not
+            # become institutions when the graph is prepared again.
+            if node.get("source") == "simulation":
+                logger.debug(f"Skipping simulation-created entity: {node.get('name', '?')}")
                 continue
 
             # If specific types requested, check for match
@@ -329,8 +450,8 @@ class EntityReader:
 
             filtered_entities.append(entity)
 
-        logger.info(f": {total_count}, {len(filtered_entities)}, "
-                     f": {entity_types_found}")
+        logger.info(f"Filter completed: total nodes {total_count}, matched {len(filtered_entities)}, "
+                     f"entity types: {entity_types_found}")
 
         return FilteredEntities(
             entities=filtered_entities,
@@ -344,7 +465,6 @@ class EntityReader:
         graph_id: str,
         entity_uuid: str
     ) -> Optional[EntityNode]:
-        """"""
         try:
             # Get the node directly by UUID (O(1) lookup)
             node = self.storage.get_node(entity_uuid)
@@ -352,7 +472,7 @@ class EntityReader:
                 return None
 
             # Get edges for this node (O(degree) via Cypher)
-            edges = self.storage.get_node_edges(entity_uuid)
+            edges = [e for e in self.storage.get_node_edges(entity_uuid) if in_run_scope(e, SEED_ONLY)]
 
             # Process related edges and collect related node UUIDs
             related_edges = []
@@ -380,7 +500,7 @@ class EntityReader:
             related_nodes = []
             for related_uuid in related_node_uuids:
                 related_node = self.storage.get_node(related_uuid)
-                if related_node:
+                if related_node and in_run_scope(related_node, SEED_ONLY):
                     related_nodes.append({
                         "uuid": related_node["uuid"],
                         "name": related_node["name"],
@@ -399,7 +519,7 @@ class EntityReader:
             )
 
         except Exception as e:
-            logger.error(f"{entity_uuid} : {str(e)}")
+            logger.error(f"Failed to get entity {entity_uuid}: {str(e)}")
             return None
 
     def get_entities_by_type(
@@ -408,7 +528,6 @@ class EntityReader:
         entity_type: str,
         enrich_with_edges: bool = True
     ) -> List[EntityNode]:
-        """"""
         result = self.filter_defined_entities(
             graph_id=graph_id,
             defined_entity_types=[entity_type],

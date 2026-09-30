@@ -1,24 +1,25 @@
-""""""
+"""
+OASIS Simulation Runner
+Run simulations in the background and record actions for each Agent, supporting real-time status monitoring
+"""
 
 import os
 import sys
 import json
 import time
-import asyncio
 import threading
 import subprocess
 import signal
 import atexit
-from typing import Dict, Any, List, Optional, Union
+from typing import Dict, Any, List, Optional
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from queue import Queue
 
-from ..config import Config
 from ..utils.logger import get_logger
 from .graph_memory_updater import GraphMemoryManager
-from .simulation_ipc import SimulationIPCClient, CommandType, IPCResponse
+from .simulation_ipc import SimulationIPCClient
 
 logger = get_logger('mirofish.simulation_runner')
 
@@ -27,7 +28,7 @@ _cleanup_registered = False
 IS_WINDOWS = sys.platform == 'win32'
 
 class RunnerStatus(str, Enum):
-    """"""
+    """Runner status"""
     IDLE = "idle"
     STARTING = "starting"
     RUNNING = "running"
@@ -39,7 +40,7 @@ class RunnerStatus(str, Enum):
 
 @dataclass
 class AgentAction:
-    """"""
+    """Agent action record"""
     round_num: int
     timestamp: str
     platform: str  # twitter / reddit
@@ -65,7 +66,7 @@ class AgentAction:
 
 @dataclass
 class RoundSummary:
-    """"""
+    """Round summary"""
     round_num: int
     start_time: str
     end_time: Optional[str] = None
@@ -90,7 +91,7 @@ class RoundSummary:
 
 @dataclass
 class SimulationRunState:
-    """"""
+    """Simulation run state (real-time)"""
     simulation_id: str
     runner_status: RunnerStatus = RunnerStatus.IDLE
     
@@ -135,7 +136,7 @@ class SimulationRunState:
     process_pid: Optional[int] = None
     
     def add_action(self, action: AgentAction):
-        """"""
+        """Add action to recent actions list"""
         self.recent_actions.insert(0, action)
         if len(self.recent_actions) > self.max_recent_actions:
             self.recent_actions = self.recent_actions[:self.max_recent_actions]
@@ -176,14 +177,13 @@ class SimulationRunState:
         }
     
     def to_detail_dict(self) -> Dict[str, Any]:
-        """"""
+        """Details with recent actions"""
         result = self.to_dict()
         result["recent_actions"] = [a.to_dict() for a in self.recent_actions]
         result["rounds_count"] = len(self.rounds)
         return result
 
 class SimulationRunner:
-    """"""
     
 
     RUN_STATE_DIR = os.path.join(
@@ -210,7 +210,7 @@ class SimulationRunner:
     
     @classmethod
     def get_run_state(cls, simulation_id: str) -> Optional[SimulationRunState]:
-        """"""
+        """Get run state"""
         if simulation_id in cls._run_states:
             return cls._run_states[simulation_id]
         
@@ -222,7 +222,7 @@ class SimulationRunner:
     
     @classmethod
     def _load_run_state(cls, simulation_id: str) -> Optional[SimulationRunState]:
-        """"""
+        """Load run state from file"""
         state_file = os.path.join(cls.RUN_STATE_DIR, simulation_id, "run_state.json")
         if not os.path.exists(state_file):
             return None
@@ -273,12 +273,12 @@ class SimulationRunner:
             
             return state
         except Exception as e:
-            logger.error(f": {str(e)}")
+            logger.error(f"Failed to load run state: {str(e)}")
             return None
     
     @classmethod
     def _save_run_state(cls, state: SimulationRunState):
-        """"""
+        """Save run state to file"""
         sim_dir = os.path.join(cls.RUN_STATE_DIR, state.simulation_id)
         os.makedirs(sim_dir, exist_ok=True)
         state_file = os.path.join(sim_dir, "run_state.json")
@@ -300,11 +300,10 @@ class SimulationRunner:
         graph_id: str = None,
         storage: 'GraphStorage' = None  # GraphStorage instance (required if enable_graph_memory_update)
     ) -> SimulationRunState:
-        """"""
 
         existing = cls.get_run_state(simulation_id)
         if existing and existing.runner_status in [RunnerStatus.RUNNING, RunnerStatus.STARTING]:
-            raise ValueError(f": {simulation_id}")
+            raise ValueError(f"Simulation already running: {simulation_id}")
         
 
         sim_dir = os.path.join(cls.RUN_STATE_DIR, simulation_id)
@@ -327,7 +326,7 @@ class SimulationRunner:
             original_rounds = total_rounds
             total_rounds = min(total_rounds, max_rounds)
             if total_rounds < original_rounds:
-                logger.info(f": {original_rounds} -> {total_rounds} (max_rounds={max_rounds})")
+                logger.info(f"Rounds truncated: {original_rounds} -> {total_rounds} (max_rounds={max_rounds})")
         
         state = SimulationRunState(
             simulation_id=simulation_id,
@@ -341,37 +340,25 @@ class SimulationRunner:
         
 
         if enable_graph_memory_update:
+            # Fail loudly: silently disabling here hid a missing storage
+            # argument in every run before 2026-09-28.
             if not graph_id:
-                raise ValueError("graph_id")
-            
-            try:
-                if not storage:
-                    raise ValueError("storage (GraphStorage)")
-                GraphMemoryManager.create_updater(simulation_id, graph_id, storage)
-                cls._graph_memory_enabled[simulation_id] = True
-                logger.info(f": simulation_id={simulation_id}, graph_id={graph_id}")
-            except Exception as e:
-                logger.error(f": {e}")
-                cls._graph_memory_enabled[simulation_id] = False
+                raise ValueError("Graph memory update requires graph_id")
+            if not storage:
+                raise ValueError("Graph memory update requires a GraphStorage instance")
+            GraphMemoryManager.create_updater(simulation_id, graph_id, storage)
+            cls._graph_memory_enabled[simulation_id] = True
+            logger.info(f"Graph memory update enabled: simulation_id={simulation_id}, graph_id={graph_id}")
         else:
             cls._graph_memory_enabled[simulation_id] = False
         
 
-        if platform == "twitter":
-            script_name = "run_twitter_simulation.py"
-            state.twitter_running = True
-        elif platform == "reddit":
-            script_name = "run_reddit_simulation.py"
-            state.reddit_running = True
-        else:
-            script_name = "run_parallel_simulation.py"
-            state.twitter_running = True
-            state.reddit_running = True
-        
-        script_path = os.path.join(cls.SCRIPTS_DIR, script_name)
+        script_path = os.path.join(cls.SCRIPTS_DIR, "run_parallel_simulation.py")
+        state.twitter_running = platform in ("twitter", "parallel")
+        state.reddit_running = platform in ("reddit", "parallel")
         
         if not os.path.exists(script_path):
-            raise ValueError(f": {script_path}")
+            raise ValueError(f"Script does not exist: {script_path}")
         
 
         action_queue = Queue()
@@ -386,6 +373,8 @@ class SimulationRunner:
                 script_path,
                 "--config", config_path,
             ]
+            if platform in ("twitter", "reddit"):
+                cmd.append(f"--{platform}-only")
             
 
             if max_rounds is not None and max_rounds > 0:
@@ -431,7 +420,7 @@ class SimulationRunner:
             monitor_thread.start()
             cls._monitor_threads[simulation_id] = monitor_thread
             
-            logger.info(f": {simulation_id}, pid={process.pid}, platform={platform}")
+            logger.info(f"Simulation started: {simulation_id}, pid={process.pid}, platform={platform}")
             
         except Exception as e:
             state.runner_status = RunnerStatus.FAILED
@@ -443,7 +432,7 @@ class SimulationRunner:
     
     @classmethod
     def _monitor_simulation(cls, simulation_id: str):
-        """"""
+        """Monitor simulation process and parse action logs"""
         sim_dir = os.path.join(cls.RUN_STATE_DIR, simulation_id)
         
 
@@ -474,6 +463,14 @@ class SimulationRunner:
                     )
                 
 
+                # Drain graph memory once every platform has logged simulation_end;
+                # the process itself stays alive to serve interviews.
+                if (cls._graph_memory_enabled.get(simulation_id, False)
+                        and cls._check_all_platforms_completed(state)):
+                    cls._graph_memory_enabled.pop(simulation_id, None)
+                    GraphMemoryManager.finish_updater(simulation_id)
+                    logger.info(f"All platforms finished, draining graph memory: simulation_id={simulation_id}")
+
                 cls._save_run_state(state)
                 time.sleep(2)
             
@@ -489,7 +486,7 @@ class SimulationRunner:
             if exit_code == 0:
                 state.runner_status = RunnerStatus.COMPLETED
                 state.completed_at = datetime.now().isoformat()
-                logger.info(f": {simulation_id}")
+                logger.info(f"Simulation completed: {simulation_id}")
             else:
                 state.runner_status = RunnerStatus.FAILED
 
@@ -501,8 +498,8 @@ class SimulationRunner:
                             error_info = f.read()[-2000:]
                 except Exception:
                     pass
-                state.error = f": {exit_code}, : {error_info}"
-                logger.error(f": {simulation_id}, error={state.error}")
+                state.error = f"Process exit code: {exit_code}, error: {error_info}"
+                logger.error(f"Simulation failed: {simulation_id}, error={state.error}")
 
             state.twitter_running = False
             state.reddit_running = False
@@ -526,21 +523,19 @@ class SimulationRunner:
                 logger.warning(f"Failed to update state.json: {simulation_id}, error={state_err}")
             
         except Exception as e:
-            logger.error(f": {simulation_id}, error={str(e)}")
+            logger.error(f"Monitor thread exception: {simulation_id}, error={str(e)}")
             state.runner_status = RunnerStatus.FAILED
             state.error = str(e)
             cls._save_run_state(state)
         
         finally:
 
-            if cls._graph_memory_enabled.get(simulation_id, False):
+            if cls._graph_memory_enabled.pop(simulation_id, False):
                 try:
-                    GraphMemoryManager.stop_updater(simulation_id)
-                    logger.info(f": simulation_id={simulation_id}")
+                    GraphMemoryManager.finish_updater(simulation_id)
+                    logger.info(f"Draining graph memory after process exit: simulation_id={simulation_id}")
                 except Exception as e:
-                    logger.error(f": {e}")
-                cls._graph_memory_enabled.pop(simulation_id, None)
-            
+                    logger.error(f"Failed to drain graph memory: {e}")
 
             cls._processes.pop(simulation_id, None)
             cls._action_queues.pop(simulation_id, None)
@@ -567,7 +562,6 @@ class SimulationRunner:
         state: SimulationRunState,
         platform: str
     ) -> int:
-        """"""
 
         graph_memory_enabled = cls._graph_memory_enabled.get(state.simulation_id, False)
         graph_updater = None
@@ -603,7 +597,7 @@ class SimulationRunner:
                                     if all_completed:
                                         state.runner_status = RunnerStatus.COMPLETED
                                         state.completed_at = datetime.now().isoformat()
-                                        logger.info(f": {state.simulation_id}")
+                                        logger.info(f"All platform simulations completed: {state.simulation_id}")
                                 
 
                                 elif event_type == "round_end":
@@ -653,12 +647,11 @@ class SimulationRunner:
                             pass
                 return f.tell()
         except Exception as e:
-            logger.warning(f": {log_path}, error={e}")
+            logger.warning(f"Failed to read action log: {log_path}, error={e}")
             return position
     
     @classmethod
     def _check_all_platforms_completed(cls, state: SimulationRunState) -> bool:
-        """"""
         sim_dir = os.path.join(cls.RUN_STATE_DIR, state.simulation_id)
         twitter_log = os.path.join(sim_dir, "twitter", "actions.jsonl")
         reddit_log = os.path.join(sim_dir, "reddit", "actions.jsonl")
@@ -678,7 +671,6 @@ class SimulationRunner:
     
     @classmethod
     def _terminate_process(cls, process: subprocess.Popen, simulation_id: str, timeout: int = 10):
-        """"""
         if IS_WINDOWS:
 
             logger.info(f"(Windows): simulation={simulation_id}, pid={process.pid}")
@@ -693,7 +685,7 @@ class SimulationRunner:
                     process.wait(timeout=timeout)
                 except subprocess.TimeoutExpired:
 
-                    logger.warning(f": {simulation_id}")
+                    logger.warning(f"Process not responding, force terminating: {simulation_id}")
                     subprocess.run(
                         ['taskkill', '/F', '/PID', str(process.pid), '/T'],
                         capture_output=True,
@@ -719,19 +711,19 @@ class SimulationRunner:
                 process.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
 
-                logger.warning(f"SIGTERM，: {simulation_id}")
+                logger.warning(f"Process group not responding to SIGTERM, force terminating: {simulation_id}")
                 os.killpg(pgid, signal.SIGKILL)
                 process.wait(timeout=5)
     
     @classmethod
     def stop_simulation(cls, simulation_id: str) -> SimulationRunState:
-        """"""
+        """Stop simulation"""
         state = cls.get_run_state(simulation_id)
         if not state:
-            raise ValueError(f": {simulation_id}")
+            raise ValueError(f"Simulation does not exist: {simulation_id}")
         
         if state.runner_status not in [RunnerStatus.RUNNING, RunnerStatus.PAUSED]:
-            raise ValueError(f": {simulation_id}, status={state.runner_status}")
+            raise ValueError(f"Simulation not running: {simulation_id}, status={state.runner_status}")
         
         state.runner_status = RunnerStatus.STOPPING
         cls._save_run_state(state)
@@ -745,7 +737,7 @@ class SimulationRunner:
 
                 pass
             except Exception as e:
-                logger.error(f": {simulation_id}, error={e}")
+                logger.error(f"Failed to terminate process group: {simulation_id}, error={e}")
 
                 try:
                     process.terminate()
@@ -760,15 +752,14 @@ class SimulationRunner:
         cls._save_run_state(state)
         
 
-        if cls._graph_memory_enabled.get(simulation_id, False):
+        if cls._graph_memory_enabled.pop(simulation_id, False):
             try:
-                GraphMemoryManager.stop_updater(simulation_id)
-                logger.info(f": simulation_id={simulation_id}")
+                GraphMemoryManager.finish_updater(simulation_id)
+                logger.info(f"Draining graph memory after stop: simulation_id={simulation_id}")
             except Exception as e:
-                logger.error(f": {e}")
-            cls._graph_memory_enabled.pop(simulation_id, None)
+                logger.error(f"Failed to drain graph memory: {e}")
         
-        logger.info(f": {simulation_id}")
+        logger.info(f"Simulation stopped: {simulation_id}")
         return state
     
     @classmethod
@@ -780,7 +771,6 @@ class SimulationRunner:
         agent_id: Optional[int] = None,
         round_num: Optional[int] = None
     ) -> List[AgentAction]:
-        """"""
         if not os.path.exists(file_path):
             return []
         
@@ -839,7 +829,6 @@ class SimulationRunner:
         agent_id: Optional[int] = None,
         round_num: Optional[int] = None
     ) -> List[AgentAction]:
-        """"""
         sim_dir = os.path.join(cls.RUN_STATE_DIR, simulation_id)
         actions = []
         
@@ -891,7 +880,6 @@ class SimulationRunner:
         agent_id: Optional[int] = None,
         round_num: Optional[int] = None
     ) -> List[AgentAction]:
-        """"""
         actions = cls.get_all_actions(
             simulation_id=simulation_id,
             platform=platform,
@@ -909,7 +897,6 @@ class SimulationRunner:
         start_round: int = 0,
         end_round: Optional[int] = None
     ) -> List[Dict[str, Any]]:
-        """"""
         actions = cls.get_actions(simulation_id, limit=10000)
         
 
@@ -965,7 +952,6 @@ class SimulationRunner:
     
     @classmethod
     def get_agent_stats(cls, simulation_id: str) -> List[Dict[str, Any]]:
-        """"""
         actions = cls.get_actions(simulation_id, limit=10000)
         
         agent_stats: Dict[int, Dict[str, Any]] = {}
@@ -1003,13 +989,12 @@ class SimulationRunner:
     
     @classmethod
     def cleanup_simulation_logs(cls, simulation_id: str) -> Dict[str, Any]:
-        """"""
-        import shutil
+        pass
         
         sim_dir = os.path.join(cls.RUN_STATE_DIR, simulation_id)
         
         if not os.path.exists(sim_dir):
-            return {"success": True, "message": ""}
+            return {"success": True, "message": "Simulation directory does not exist, no cleanup needed"}
         
         cleaned_files = []
         errors = []
@@ -1036,7 +1021,7 @@ class SimulationRunner:
                     os.remove(file_path)
                     cleaned_files.append(filename)
                 except Exception as e:
-                    errors.append(f"{filename} : {str(e)}")
+                    errors.append(f"Failed to delete {filename}: {str(e)}")
         
 
         for dir_name in dirs_to_clean:
@@ -1054,7 +1039,7 @@ class SimulationRunner:
         if simulation_id in cls._run_states:
             del cls._run_states[simulation_id]
         
-        logger.info(f": {simulation_id}, : {cleaned_files}")
+        logger.info(f"Cleanup simulation logs completed: {simulation_id}, deleted files: {cleaned_files}")
         
         return {
             "success": len(errors) == 0,
@@ -1067,7 +1052,6 @@ class SimulationRunner:
     
     @classmethod
     def cleanup_all_simulations(cls):
-        """"""
 
         if cls._cleanup_done:
             return
@@ -1080,13 +1064,13 @@ class SimulationRunner:
         if not has_processes and not has_updaters:
             return
         
-        logger.info("...")
+        logger.info("Cleaning up all simulation processes...")
         
 
         try:
             GraphMemoryManager.stop_all()
         except Exception as e:
-            logger.error(f": {e}")
+            logger.error(f"Failed to stop graph memory updater: {e}")
         cls._graph_memory_enabled.clear()
         
 
@@ -1095,7 +1079,7 @@ class SimulationRunner:
         for simulation_id, process in processes:
             try:
                 if process.poll() is None:
-                    logger.info(f": {simulation_id}, pid={process.pid}")
+                    logger.info(f"Terminating simulation process: {simulation_id}, pid={process.pid}")
                     
                     try:
 
@@ -1115,7 +1099,7 @@ class SimulationRunner:
                         state.twitter_running = False
                         state.reddit_running = False
                         state.completed_at = datetime.now().isoformat()
-                        state.error = ""
+                        state.error = "Server closed, simulation terminated"
                         cls._save_run_state(state)
                     
 
@@ -1130,14 +1114,14 @@ class SimulationRunner:
                             state_data['updated_at'] = datetime.now().isoformat()
                             with open(state_file, 'w', encoding='utf-8') as f:
                                 json.dump(state_data, f, indent=2, ensure_ascii=False)
-                            logger.info(f"state.json stopped: {simulation_id}")
+                            logger.info(f"Updated state.json status to stopped: {simulation_id}")
                         else:
-                            logger.warning(f"state.json : {state_file}")
+                            logger.warning(f"state.json does not exist: {state_file}")
                     except Exception as state_err:
-                        logger.warning(f"state.json : {simulation_id}, error={state_err}")
+                        logger.warning(f"Failed to update state.json: {simulation_id}, error={state_err}")
                         
             except Exception as e:
-                logger.error(f": {simulation_id}, error={e}")
+                logger.error(f"Failed to clean up process: {simulation_id}, error={e}")
         
 
         for simulation_id, file_handle in list(cls._stdout_files.items()):
@@ -1160,11 +1144,10 @@ class SimulationRunner:
         cls._processes.clear()
         cls._action_queues.clear()
         
-        logger.info("")
+        logger.info("Simulation process cleanup completed")
     
     @classmethod
     def register_cleanup(cls):
-        """"""
         global _cleanup_registered
         
         if _cleanup_registered:
@@ -1189,10 +1172,10 @@ class SimulationRunner:
             original_sighup = signal.getsignal(signal.SIGHUP)
         
         def cleanup_handler(signum=None, frame=None):
-            """"""
+            """Signal handler: clean up simulation processes first, then call original handler"""
 
             if cls._processes or cls._graph_memory_enabled:
-                logger.info(f"{signum}，...")
+                logger.info(f"Received signal {signum}, starting cleanup...")
             cls.cleanup_all_simulations()
             
 
@@ -1230,19 +1213,7 @@ class SimulationRunner:
         _cleanup_registered = True
     
     @classmethod
-    def get_running_simulations(cls) -> List[str]:
-        """"""
-        running = []
-        for sim_id, process in cls._processes.items():
-            if process.poll() is None:
-                running.append(sim_id)
-        return running
-    
-
-    
-    @classmethod
     def check_env_alive(cls, simulation_id: str) -> bool:
-        """"""
         sim_dir = os.path.join(cls.RUN_STATE_DIR, simulation_id)
         if not os.path.exists(sim_dir):
             return False
@@ -1252,7 +1223,6 @@ class SimulationRunner:
 
     @classmethod
     def get_env_status_detail(cls, simulation_id: str) -> Dict[str, Any]:
-        """"""
         sim_dir = os.path.join(cls.RUN_STATE_DIR, simulation_id)
         status_file = os.path.join(sim_dir, "env_status.json")
         
@@ -1287,7 +1257,6 @@ class SimulationRunner:
         platform: str = None,
         timeout: float = 120.0
     ) -> Dict[str, Any]:
-        """"""
         sim_dir = os.path.join(cls.RUN_STATE_DIR, simulation_id)
         if not os.path.exists(sim_dir):
             raise ValueError(f"Simulation not found: {simulation_id}")
@@ -1331,7 +1300,6 @@ class SimulationRunner:
         platform: str = None,
         timeout: float = 120.0
     ) -> Dict[str, Any]:
-        """"""
         sim_dir = os.path.join(cls.RUN_STATE_DIR, simulation_id)
         if not os.path.exists(sim_dir):
             raise ValueError(f"Simulation not found: {simulation_id}")
@@ -1365,74 +1333,31 @@ class SimulationRunner:
             }
     
     @classmethod
-    def interview_all_agents(
-        cls,
-        simulation_id: str,
-        prompt: str,
-        platform: str = None,
-        timeout: float = 180.0
-    ) -> Dict[str, Any]:
-        """"""
-        sim_dir = os.path.join(cls.RUN_STATE_DIR, simulation_id)
-        if not os.path.exists(sim_dir):
-            raise ValueError(f": {simulation_id}")
-
-        config_path = os.path.join(sim_dir, "simulation_config.json")
-        if not os.path.exists(config_path):
-            raise ValueError(f": {simulation_id}")
-
-        with open(config_path, 'r', encoding='utf-8') as f:
-            config = json.load(f)
-
-        agent_configs = config.get("agent_configs", [])
-        if not agent_configs:
-            raise ValueError(f"Agent: {simulation_id}")
-
-        interviews = []
-        for agent_config in agent_configs:
-            agent_id = agent_config.get("agent_id")
-            if agent_id is not None:
-                interviews.append({
-                    "agent_id": agent_id,
-                    "prompt": prompt
-                })
-
-        logger.info(f"Interview: simulation_id={simulation_id}, agent_count={len(interviews)}, platform={platform}")
-
-        return cls.interview_agents_batch(
-            simulation_id=simulation_id,
-            interviews=interviews,
-            platform=platform,
-            timeout=timeout
-        )
-    
-    @classmethod
     def close_simulation_env(
         cls,
         simulation_id: str,
         timeout: float = 30.0
     ) -> Dict[str, Any]:
-        """"""
         sim_dir = os.path.join(cls.RUN_STATE_DIR, simulation_id)
         if not os.path.exists(sim_dir):
-            raise ValueError(f": {simulation_id}")
+            raise ValueError(f"Simulation does not exist: {simulation_id}")
         
         ipc_client = SimulationIPCClient(sim_dir)
         
         if not ipc_client.check_env_alive():
             return {
                 "success": True,
-                "message": ""
+                "message": "Environment already closed"
             }
         
-        logger.info(f": simulation_id={simulation_id}")
+        logger.info(f"Sent close environment command: simulation_id={simulation_id}")
         
         try:
             response = ipc_client.send_close_env(timeout=timeout)
             
             return {
                 "success": response.status.value == "completed",
-                "message": "",
+                "message": "Close environment command sent",
                 "result": response.result,
                 "timestamp": response.timestamp
             }
@@ -1440,103 +1365,6 @@ class SimulationRunner:
 
             return {
                 "success": True,
-                "message": ""
+                "message": "Close environment command sent (timeout waiting for response, environment may be closing)"
             }
     
-    @classmethod
-    def _get_interview_history_from_db(
-        cls,
-        db_path: str,
-        platform_name: str,
-        agent_id: Optional[int] = None,
-        limit: int = 100
-    ) -> List[Dict[str, Any]]:
-        """"""
-        import sqlite3
-        
-        if not os.path.exists(db_path):
-            return []
-        
-        results = []
-        
-        try:
-            conn = sqlite3.connect(db_path)
-            cursor = conn.cursor()
-            
-            if agent_id is not None:
-                cursor.execute("""
-                    SELECT user_id, info, created_at
-                    FROM trace
-                    WHERE action = 'interview' AND user_id = ?
-                    ORDER BY created_at DESC
-                    LIMIT ?
-                """, (agent_id, limit))
-            else:
-                cursor.execute("""
-                    SELECT user_id, info, created_at
-                    FROM trace
-                    WHERE action = 'interview'
-                    ORDER BY created_at DESC
-                    LIMIT ?
-                """, (limit,))
-            
-            for user_id, info_json, created_at in cursor.fetchall():
-                try:
-                    info = json.loads(info_json) if info_json else {}
-                except json.JSONDecodeError:
-                    info = {"raw": info_json}
-                
-                results.append({
-                    "agent_id": user_id,
-                    "response": info.get("response", info),
-                    "prompt": info.get("prompt", ""),
-                    "timestamp": created_at,
-                    "platform": platform_name
-                })
-            
-            conn.close()
-            
-        except Exception as e:
-            logger.error(f"Interview({platform_name}): {e}")
-        
-        return results
-
-    @classmethod
-    def get_interview_history(
-        cls,
-        simulation_id: str,
-        platform: str = None,
-        agent_id: Optional[int] = None,
-        limit: int = 100
-    ) -> List[Dict[str, Any]]:
-        """"""
-        sim_dir = os.path.join(cls.RUN_STATE_DIR, simulation_id)
-        
-        results = []
-        
-
-        if platform in ("reddit", "twitter"):
-            platforms = [platform]
-        else:
-
-            platforms = ["twitter", "reddit"]
-        
-        for p in platforms:
-            db_path = os.path.join(sim_dir, f"{p}_simulation.db")
-            platform_results = cls._get_interview_history_from_db(
-                db_path=db_path,
-                platform_name=p,
-                agent_id=agent_id,
-                limit=limit
-            )
-            results.extend(platform_results)
-        
-
-        results.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
-        
-
-        if len(platforms) > 1 and len(results) > limit:
-            results = results[:limit]
-        
-        return results
-

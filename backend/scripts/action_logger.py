@@ -1,16 +1,28 @@
-""""""
+"""
+Action logger
+Used to record actions of each Agent in OASIS simulation for backend monitoring
+
+Log structure:
+    sim_xxx/
+    ├── twitter/
+    │   └── actions.jsonl    # Twitter platform action log
+    ├── reddit/
+    │   └── actions.jsonl    # Reddit platform action log
+    ├── simulation.log       # Main simulation process log
+    └── run_state.json       # Run state (for API queries)
+"""
 
 import json
 import os
+import sys
 import logging
 from datetime import datetime
 from typing import Dict, Any, Optional
 
 class PlatformActionLogger:
-    """"""
+    """Single platform action logger"""
     
     def __init__(self, platform: str, base_dir: str):
-        """"""
         self.platform = platform
         self.base_dir = base_dir
         self.log_dir = os.path.join(base_dir, platform)
@@ -18,7 +30,7 @@ class PlatformActionLogger:
         self._ensure_dir()
     
     def _ensure_dir(self):
-        """"""
+        """Ensure directory exists"""
         os.makedirs(self.log_dir, exist_ok=True)
     
     def log_action(
@@ -31,7 +43,7 @@ class PlatformActionLogger:
         result: Optional[str] = None,
         success: bool = True
     ):
-        """"""
+        """Log an action"""
         entry = {
             "round": round_num,
             "timestamp": datetime.now().isoformat(),
@@ -46,20 +58,22 @@ class PlatformActionLogger:
         with open(self.log_path, 'a', encoding='utf-8') as f:
             f.write(json.dumps(entry, ensure_ascii=False) + '\n')
     
-    def log_round_start(self, round_num: int, simulated_hour: int):
-        """"""
+    def log_round_start(self, round_num: int, simulated_hour: int, sim_time: str = None):
+        """Log round start. sim_time is the scenario date and time (ISO), when known."""
         entry = {
             "round": round_num,
             "timestamp": datetime.now().isoformat(),
             "event_type": "round_start",
             "simulated_hour": simulated_hour,
         }
+        if sim_time:
+            entry["sim_time"] = sim_time
         
         with open(self.log_path, 'a', encoding='utf-8') as f:
             f.write(json.dumps(entry, ensure_ascii=False) + '\n')
     
     def log_round_end(self, round_num: int, actions_count: int):
-        """"""
+        """Log round end"""
         entry = {
             "round": round_num,
             "timestamp": datetime.now().isoformat(),
@@ -71,7 +85,7 @@ class PlatformActionLogger:
             f.write(json.dumps(entry, ensure_ascii=False) + '\n')
     
     def log_simulation_start(self, config: Dict[str, Any]):
-        """"""
+        """Log simulation start"""
         entry = {
             "timestamp": datetime.now().isoformat(),
             "event_type": "simulation_start",
@@ -84,7 +98,7 @@ class PlatformActionLogger:
             f.write(json.dumps(entry, ensure_ascii=False) + '\n')
     
     def log_simulation_end(self, total_rounds: int, total_actions: int):
-        """"""
+        """Log simulation end"""
         entry = {
             "timestamp": datetime.now().isoformat(),
             "event_type": "simulation_end",
@@ -96,11 +110,17 @@ class PlatformActionLogger:
         with open(self.log_path, 'a', encoding='utf-8') as f:
             f.write(json.dumps(entry, ensure_ascii=False) + '\n')
 
+def _stdout_is_file(path: str) -> bool:
+    """True when this process's stdout is already the file at path."""
+    try:
+        return os.path.samestat(os.fstat(sys.stdout.fileno()), os.stat(path))
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
 class SimulationLogManager:
-    """"""
     
     def __init__(self, simulation_dir: str):
-        """"""
         self.simulation_dir = simulation_dir
         self.twitter_logger: Optional[PlatformActionLogger] = None
         self.reddit_logger: Optional[PlatformActionLogger] = None
@@ -110,7 +130,7 @@ class SimulationLogManager:
         self._setup_main_logger()
     
     def _setup_main_logger(self):
-        """"""
+        """Setup main simulation log"""
         log_path = os.path.join(self.simulation_dir, "simulation.log")
         
 
@@ -119,13 +139,18 @@ class SimulationLogManager:
         self._main_logger.handlers.clear()
         
 
-        file_handler = logging.FileHandler(log_path, encoding='utf-8', mode='w')
-        file_handler.setLevel(logging.INFO)
-        file_handler.setFormatter(logging.Formatter(
-            '%(asctime)s - %(levelname)s - %(message)s',
-            datefmt='%Y-%m-%d %H:%M:%S'
-        ))
-        self._main_logger.addHandler(file_handler)
+        # When launched by SimulationRunner, stdout/stderr already go to
+        # simulation.log. A second 'w' handle on the same file writes at its own
+        # offset and overwrites the stdout lines, so only add a file handler when
+        # running standalone.
+        if not _stdout_is_file(log_path):
+            file_handler = logging.FileHandler(log_path, encoding='utf-8', mode='w')
+            file_handler.setLevel(logging.INFO)
+            file_handler.setFormatter(logging.Formatter(
+                '%(asctime)s - %(levelname)s - %(message)s',
+                datefmt='%Y-%m-%d %H:%M:%S'
+            ))
+            self._main_logger.addHandler(file_handler)
         
 
         console_handler = logging.StreamHandler()
@@ -139,19 +164,19 @@ class SimulationLogManager:
         self._main_logger.propagate = False
     
     def get_twitter_logger(self) -> PlatformActionLogger:
-        """"""
+        """Get Twitter platform logger"""
         if self.twitter_logger is None:
             self.twitter_logger = PlatformActionLogger("twitter", self.simulation_dir)
         return self.twitter_logger
     
     def get_reddit_logger(self) -> PlatformActionLogger:
-        """"""
+        """Get Reddit platform logger"""
         if self.reddit_logger is None:
             self.reddit_logger = PlatformActionLogger("reddit", self.simulation_dir)
         return self.reddit_logger
     
     def log(self, message: str, level: str = "info"):
-        """"""
+        """Log main message"""
         if self._main_logger:
             getattr(self._main_logger, level.lower(), self._main_logger.info)(message)
     
@@ -168,7 +193,6 @@ class SimulationLogManager:
         self.log(message, "debug")
 
 class ActionLogger:
-    """"""
     
     def __init__(self, log_path: str):
         self.log_path = log_path
@@ -256,7 +280,7 @@ class ActionLogger:
 _global_logger: Optional[ActionLogger] = None
 
 def get_logger(log_path: Optional[str] = None) -> ActionLogger:
-    """"""
+    """Get global logger instance (compatible with old interface)"""
     global _global_logger
     
     if log_path:

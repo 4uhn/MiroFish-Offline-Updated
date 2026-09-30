@@ -76,3 +76,6 @@ ROADMAP.md
 *.db-journal
 *.db-wal
 *.db-shm
+
+# Personal notes
+findings.md

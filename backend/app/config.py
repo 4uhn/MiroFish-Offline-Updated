@@ -18,35 +18,13 @@ class Config:
     """Flask application configuration."""
 
     SECRET_KEY = os.environ.get('SECRET_KEY', 'mirofish-secret-key')
-    DEBUG = os.environ.get('FLASK_DEBUG', 'True').lower() == 'true'
+    DEBUG = os.environ.get('FLASK_DEBUG', 'False').lower() == 'true'
     JSON_AS_ASCII = False
 
-    # ── LLM Provider Configuration ──
-    # LLM_PROVIDER selects the backend: "ollama" (default) or "groq"
-    # Provider-specific env vars are resolved into unified LLM_API_KEY / LLM_BASE_URL / LLM_MODEL_NAME
-    LLM_PROVIDER = os.environ.get('LLM_PROVIDER', 'ollama').lower()
-
-    @staticmethod
-    def _resolve_llm_config():
-        """Resolve provider-specific env vars into unified LLM config."""
-        provider = os.environ.get('LLM_PROVIDER', 'ollama').lower()
-
-        if provider == 'groq':
-            api_key = os.environ.get('GROQ_API_KEY', '')
-            base_url = 'https://api.groq.com/openai/v1'
-            model = os.environ.get('GROQ_MODEL', 'llama-3.3-70b-versatile')
-        else:
-            # Default: ollama (or any OpenAI-compatible provider)
-            api_key = os.environ.get('LLM_API_KEY', 'ollama')
-            base_url = os.environ.get('LLM_BASE_URL', 'http://localhost:11434/v1')
-            model = os.environ.get('LLM_MODEL_NAME', 'qwen3:8b')
-
-        return api_key, base_url, model
-
-    LLM_API_KEY, LLM_BASE_URL, LLM_MODEL_NAME = _resolve_llm_config.__func__()
-
-    # Tiered model routing — fast model for extraction tasks (NER, classification)
-    LLM_FAST_MODEL_NAME = os.environ.get('LLM_FAST_MODEL_NAME', '').strip()
+    # LLM: Ollama by default, or any OpenAI-compatible server
+    LLM_API_KEY = os.environ.get('LLM_API_KEY', 'ollama')
+    LLM_BASE_URL = os.environ.get('LLM_BASE_URL', 'http://localhost:11434/v1')
+    LLM_MODEL_NAME = os.environ.get('LLM_MODEL_NAME', 'qwen3:8b')
 
     # Propagate resolved values into env so CAMEL-AI / simulation scripts inherit them
     os.environ.setdefault('LLM_API_KEY', LLM_API_KEY or '')
@@ -76,29 +54,12 @@ class Config:
     DEFAULT_CHUNK_OVERLAP = 50
 
     # OASIS simulation
-    OASIS_DEFAULT_MAX_ROUNDS = int(os.environ.get('OASIS_DEFAULT_MAX_ROUNDS', '10'))
     OASIS_SIMULATION_DATA_DIR = os.path.join(os.path.dirname(__file__), '../uploads/simulations')
-    OASIS_TWITTER_ACTIONS = [
-        'CREATE_POST', 'LIKE_POST', 'REPOST', 'FOLLOW', 'DO_NOTHING', 'QUOTE_POST'
-    ]
-    OASIS_REDDIT_ACTIONS = [
-        'LIKE_POST', 'DISLIKE_POST', 'CREATE_POST', 'CREATE_COMMENT',
-        'LIKE_COMMENT', 'DISLIKE_COMMENT', 'SEARCH_POSTS', 'SEARCH_USER',
-        'TREND', 'REFRESH', 'DO_NOTHING', 'FOLLOW', 'MUTE'
-    ]
-
-    # Report agent
-    REPORT_AGENT_MAX_TOOL_CALLS = int(os.environ.get('REPORT_AGENT_MAX_TOOL_CALLS', '5'))
-    REPORT_AGENT_MAX_REFLECTION_ROUNDS = int(os.environ.get('REPORT_AGENT_MAX_REFLECTION_ROUNDS', '2'))
-    REPORT_AGENT_TEMPERATURE = float(os.environ.get('REPORT_AGENT_TEMPERATURE', '0.5'))
 
     @classmethod
     def validate(cls):
         errors = []
-        if cls.LLM_PROVIDER == 'groq':
-            if not os.environ.get('GROQ_API_KEY'):
-                errors.append("GROQ_API_KEY is required when LLM_PROVIDER=groq (get one at https://console.groq.com)")
-        elif not cls.LLM_API_KEY:
+        if not cls.LLM_API_KEY:
             errors.append("LLM_API_KEY is not configured (set to any non-empty value, e.g. 'ollama')")
         if not cls.NEO4J_URI:
             errors.append("NEO4J_URI is not configured")

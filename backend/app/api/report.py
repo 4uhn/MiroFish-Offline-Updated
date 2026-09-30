@@ -1,15 +1,16 @@
 """Report API routes — generation, retrieval, chat, and agent logs."""
 
 import os
+import time
 import traceback
 import threading
 from flask import request, jsonify, send_file, current_app
 
 from . import report_bp
-from ..config import Config
-from ..services.report_agent import ReportAgent, ReportManager, ReportStatus
+from ..services.report_agent import ReportAgent, ReportManager, ReportStatus, ReportConsoleLogger
 from ..services.graph_tools import GraphToolsService
 from ..services.simulation_manager import SimulationManager
+from ..services.graph_memory_updater import GraphMemoryManager
 from ..models.project import ProjectManager
 from ..models.task import TaskManager, TaskStatus
 from ..utils.logger import get_logger
@@ -66,7 +67,7 @@ def generate_report():
         storage = current_app.extensions.get('neo4j_storage')
         if not storage:
             return jsonify({"success": False, "error": "Neo4j not connected — check Neo4j service"}), 503
-        graph_tools = GraphToolsService(storage=storage)
+        graph_tools = GraphToolsService(storage=storage, simulation_id=simulation_id)
 
         import uuid
         report_id = f"report_{uuid.uuid4().hex[:12]}"
@@ -89,6 +90,53 @@ def generate_report():
                     progress=0,
                     message="Initialising Report Agent..."
                 )
+
+                # The report plans from the graph, so wait for the simulation's
+                # activity to finish writing to it (Run 8 planned at ~27%).
+                drain_timeout = float(os.environ.get('GRAPH_MEMORY_DRAIN_TIMEOUT', '1800'))
+
+                # The report page only shows the report's console log, so write
+                # the wait there too (Run 9 sat on a blank page for the drain).
+                wait_console = ReportConsoleLogger(report_id)
+                wait_log = get_logger('mirofish.report_agent')
+                wait_started = time.time()
+                first_pending = GraphMemoryManager.pending_count(simulation_id)
+                last_pending = None
+
+                def on_wait(pending):
+                    nonlocal last_pending
+                    task_manager.update_task(
+                        task_id,
+                        message=f"Waiting for {pending} simulation activities to reach the graph..."
+                    )
+                    if pending == last_pending:
+                        return
+                    last_pending = pending
+                    done = first_pending - pending
+                    eta = ""
+                    # Batches of 5 finish 3 at a time, so the rate is noise
+                    # until a few batches are done
+                    if done >= 10:
+                        minutes = (time.time() - wait_started) / done * pending / 60
+                        eta = " (<1 min left)" if minutes < 1 else f" (~{minutes:.0f} min left)"
+                    wait_log.info(
+                        f"Waiting for the simulation to finish writing to the graph: "
+                        f"{pending} activities left{eta}"
+                    )
+
+                try:
+                    drained = GraphMemoryManager.wait_until_drained(simulation_id, drain_timeout, on_wait)
+                    if drained:
+                        if first_pending:
+                            wait_log.info(f"Graph up to date after {time.time() - wait_started:.0f}s, starting report")
+                    else:
+                        wait_log.warning(
+                            f"Graph memory still pending after {drain_timeout:.0f}s "
+                            f"({GraphMemoryManager.pending_count(simulation_id)} activities); "
+                            f"generating report from a partial graph: simulation_id={simulation_id}"
+                        )
+                finally:
+                    wait_console.close()
 
                 agent = ReportAgent(
                     graph_id=graph_id,
@@ -367,7 +415,7 @@ def chat_with_report_agent():
         storage = current_app.extensions.get('neo4j_storage')
         if not storage:
             return jsonify({"success": False, "error": "Neo4j not connected — check Neo4j service"}), 503
-        graph_tools = GraphToolsService(storage=storage)
+        graph_tools = GraphToolsService(storage=storage, simulation_id=simulation_id)
 
         agent = ReportAgent(
             graph_id=graph_id,

@@ -9,10 +9,11 @@ import json
 import time
 import uuid
 import logging
+import threading
 from datetime import datetime, timezone
-from typing import Dict, Any, List, Optional, Callable
+from typing import Dict, Any, List, Optional, Tuple
 
-from neo4j import GraphDatabase, Session as Neo4jSession
+from neo4j import GraphDatabase
 from neo4j.exceptions import (
     TransientError,
     ServiceUnavailable,
@@ -22,7 +23,8 @@ from neo4j.exceptions import (
 from ..config import Config
 from .graph_storage import GraphStorage
 from .embedding_service import EmbeddingService
-from .ner_extractor import NERExtractor
+from .ner_extractor import NERExtractor, ground_extraction
+from ..utils.entity_names import find_alias
 from .search_service import SearchService
 from . import neo4j_schema
 
@@ -53,6 +55,9 @@ class Neo4jStorage(GraphStorage):
         self._embedding = embedding_service or EmbeddingService()
         self._ner = ner_extractor or NERExtractor()
         self._search = SearchService(self._embedding)
+        # add_text runs NER concurrently during the graph memory drain; the
+        # alias lookup + entity merge that follows must not interleave.
+        self._write_lock = threading.Lock()
 
         # Initialize schema (indexes, constraints)
         self._ensure_schema()
@@ -173,8 +178,71 @@ class Neo4jStorage(GraphStorage):
     # Add data (NER → nodes/edges)
     # ----------------------------------------------------------------
 
-    def add_text(self, graph_id: str, text: str) -> str:
-        """Process text: NER/RE → batch embed → create nodes/edges → return episode_id."""
+    def _resolve_aliases(
+        self, graph_id: str, entities: List[Dict[str, Any]], relations: List[Dict[str, Any]]
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """Rename extracted entities to an existing graph node's name when they are aliases.
+
+        Nodes MERGE on the lowercase name, so without this "Environmental Agency" in
+        one chunk and "Environment Agency" in another became two nodes (Run 8 had
+        3 for the Environment Agency and 3 for the DWI).
+        """
+        with self._driver.session() as session:
+            existing = [
+                r["name"] for r in session.run(
+                    "MATCH (n:Entity {graph_id: $gid}) RETURN n.name AS name", gid=graph_id
+                ) if r["name"]
+            ]
+        if not existing:
+            return entities, relations
+        existing_lower = {n.lower() for n in existing}
+
+        renamed: Dict[str, str] = {}
+        resolved_entities = []
+        for entity in entities:
+            name = entity["name"]
+            if name.lower() not in existing_lower:
+                alias = find_alias(name, existing)
+                if alias:
+                    renamed[name.lower()] = alias
+                    entity = {**entity, "name": alias}
+            if any(e["name"].lower() == entity["name"].lower() for e in resolved_entities):
+                continue
+            resolved_entities.append(entity)
+
+        if not renamed:
+            return entities, relations
+        logger.info(f"[add_text] Resolved {len(renamed)} aliases to existing nodes: {renamed}")
+
+        resolved_relations = []
+        for rel in relations:
+            src = renamed.get(rel["source"].lower(), rel["source"])
+            tgt = renamed.get(rel["target"].lower(), rel["target"])
+            if src.lower() != tgt.lower():
+                resolved_relations.append({**rel, "source": src, "target": tgt})
+        return resolved_entities, resolved_relations
+
+    def add_text(
+        self,
+        graph_id: str,
+        text: str,
+        source: str = "document",
+        simulation_id: Optional[str] = None,
+        grounding: Optional[List[Dict[str, Any]]] = None,
+    ) -> str:
+        """Process text: NER/RE → batch embed → create nodes/edges → return episode_id.
+
+        source is "document" for the seed text or "simulation" for agent
+        activity. It is stored on the episode, on each relation and on entities
+        the text creates, so the report can tell seed facts from things agents
+        made up: Run 10's graph held "River Wye" and "Civic Health Centre",
+        which only agents' posts mentioned.
+
+        simulation_id is stored on the episode and relations, and added to
+        each entity's simulation_ids, so a report reads only its own run when
+        a graph is reused. grounding filters the extraction to what the
+        activities support (see ground_extraction).
+        """
         episode_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc).isoformat()
 
@@ -184,12 +252,28 @@ class Neo4jStorage(GraphStorage):
         # Extract entities and relations
         logger.info(f"[add_text] Starting NER extraction for chunk ({len(text)} chars)...")
         extraction = self._ner.extract(text, ontology)
+        if grounding is not None:
+            extraction = ground_extraction(extraction, grounding, text)
         entities = extraction.get("entities", [])
         relations = extraction.get("relations", [])
 
         logger.info(
             f"[add_text] NER done: {len(entities)} entities, {len(relations)} relations"
         )
+
+        with self._write_lock:
+            return self._write_extraction(
+                graph_id, text, episode_id, now, entities, relations, source, simulation_id
+            )
+
+    def _write_extraction(
+        self, graph_id: str, text: str, episode_id: str, now: str,
+        entities: List[Dict[str, Any]], relations: List[Dict[str, Any]],
+        source: str = "document",
+        simulation_id: Optional[str] = None,
+    ) -> str:
+        """Resolve aliases, embed and write one NER result. Caller holds _write_lock."""
+        entities, relations = self._resolve_aliases(graph_id, entities, relations)
 
         # --- Batch embed all texts at once ---
         entity_summaries = [f"{e['name']} ({e['type']})" for e in entities]
@@ -219,12 +303,16 @@ class Neo4jStorage(GraphStorage):
                         graph_id: $graph_id,
                         data: $data,
                         processed: true,
+                        source: $source,
+                        simulation_id: $simulation_id,
                         created_at: $created_at
                     })
                     """,
                     uuid=episode_id,
                     graph_id=graph_id,
                     data=text,
+                    source=source,
+                    simulation_id=simulation_id,
                     created_at=now,
                 )
 
@@ -245,7 +333,9 @@ class Neo4jStorage(GraphStorage):
                 def _merge_entity(tx, _uuid=e_uuid, _name=ename, _type=etype,
                                   _attrs=attrs, _embedding=embedding,
                                   _summary=summary_text, _now=now):
-                    # MERGE by graph_id + lowercase name to deduplicate
+                    # MERGE by graph_id + lowercase name to deduplicate. Agent
+                    # activity never rewrites a seed entity's attributes or
+                    # embedding: the next prepare builds profiles from them.
                     result = tx.run(
                         """
                         MERGE (n:Entity {graph_id: $gid, name_lower: $name_lower})
@@ -255,12 +345,21 @@ class Neo4jStorage(GraphStorage):
                             n.summary = $summary,
                             n.attributes_json = $attrs_json,
                             n.embedding = $embedding,
+                            n.source = $source,
+                            n.simulation_ids = CASE WHEN $sim IS NULL THEN [] ELSE [$sim] END,
                             n.created_at = $now
                         ON MATCH SET
                             n.summary = CASE WHEN n.summary = '' OR n.summary IS NULL
                                 THEN $summary ELSE n.summary END,
-                            n.attributes_json = $attrs_json,
-                            n.embedding = $embedding
+                            n.attributes_json = CASE
+                                WHEN $source = 'simulation' AND coalesce(n.source, 'document') <> 'simulation'
+                                THEN n.attributes_json ELSE $attrs_json END,
+                            n.embedding = CASE
+                                WHEN $source = 'simulation' AND coalesce(n.source, 'document') <> 'simulation'
+                                THEN n.embedding ELSE $embedding END,
+                            n.simulation_ids = CASE
+                                WHEN $sim IS NULL OR $sim IN coalesce(n.simulation_ids, [])
+                                THEN n.simulation_ids ELSE coalesce(n.simulation_ids, []) + $sim END
                         RETURN n.uuid AS uuid
                         """,
                         gid=graph_id,
@@ -270,6 +369,8 @@ class Neo4jStorage(GraphStorage):
                         summary=_summary,
                         attrs_json=json.dumps(_attrs, ensure_ascii=False),
                         embedding=_embedding,
+                        source=source,
+                        sim=simulation_id,
                         now=_now,
                     )
                     record = result.single()
@@ -278,12 +379,18 @@ class Neo4jStorage(GraphStorage):
                 actual_uuid = self._call_with_retry(session.execute_write, _merge_entity)
                 entity_uuid_map[ename.lower()] = actual_uuid
 
-                # Add entity type label
+                # Add the entity type label only if the node has none yet. Each
+                # episode's NER may type a known entity differently; adding every
+                # guess left Run 9's Eastville Chemical Works labelled
+                # ConstructionCompany + EnvironmentalGroup + Organization.
                 if etype and etype != "Entity":
+                    etype = etype.replace("`", "")
                     try:
                         def _add_label(tx, _name_lower=ename.lower()):
                             tx.run(
-                                f"MATCH (n:Entity {{graph_id: $gid, name_lower: $nl}}) SET n:`{etype}`",
+                                f"MATCH (n:Entity {{graph_id: $gid, name_lower: $nl}}) "
+                                f"WHERE all(l IN labels(n) WHERE l IN ['Entity', 'Node']) "
+                                f"SET n:`{etype}`",
                                 gid=graph_id,
                                 nl=_name_lower,
                             )
@@ -291,7 +398,11 @@ class Neo4jStorage(GraphStorage):
                     except Exception as e:
                         logger.warning(f"Failed to add label '{etype}' to '{ename}': {e}")
 
-            # Create relations
+            # Create relations. A fact already recorded between the same two
+            # entities by the same source and run gains this episode instead of
+            # a copy: Run 12 held "Local campaigners blame Bristol Water for
+            # ignoring their warnings" three times, which read as three voices.
+            merged = 0
             for idx, relation in enumerate(relations):
                 source_name = relation["source"]
                 target_name = relation["target"]
@@ -311,10 +422,32 @@ class Neo4jStorage(GraphStorage):
                 fact_embedding = relation_embeddings[idx] if idx < len(relation_embeddings) else []
                 r_uuid = str(uuid.uuid4())
 
-                def _create_relation(tx, _r_uuid=r_uuid, _source_uuid=source_uuid,
-                                     _target_uuid=target_uuid, _rtype=rtype,
-                                     _fact=fact, _fact_emb=fact_embedding,
-                                     _episode_id=episode_id, _now=now):
+                def _write_relation(tx, _r_uuid=r_uuid, _source_uuid=source_uuid,
+                                    _target_uuid=target_uuid, _rtype=rtype,
+                                    _fact=fact, _fact_emb=fact_embedding,
+                                    _episode_id=episode_id, _now=now):
+                    existing = tx.run(
+                        """
+                        MATCH (:Entity {uuid: $src_uuid})-[r:RELATION {graph_id: $gid, name: $name}]->(:Entity {uuid: $tgt_uuid})
+                        WHERE toLower(r.fact) = toLower($fact)
+                          AND coalesce(r.source, 'document') = $source
+                          AND coalesce(r.simulation_id, '') = coalesce($sim, '')
+                        WITH r LIMIT 1
+                        SET r.episode_ids = CASE WHEN $episode_id IN coalesce(r.episode_ids, [])
+                            THEN r.episode_ids ELSE coalesce(r.episode_ids, []) + $episode_id END
+                        RETURN r.uuid AS uuid
+                        """,
+                        src_uuid=_source_uuid,
+                        tgt_uuid=_target_uuid,
+                        gid=graph_id,
+                        name=_rtype,
+                        fact=_fact,
+                        source=source,
+                        sim=simulation_id,
+                        episode_id=_episode_id,
+                    ).single()
+                    if existing:
+                        return False
                     tx.run(
                         """
                         MATCH (src:Entity {uuid: $src_uuid})
@@ -327,6 +460,8 @@ class Neo4jStorage(GraphStorage):
                             fact_embedding: $fact_embedding,
                             attributes_json: '{}',
                             episode_ids: [$episode_id],
+                            source: $source,
+                            simulation_id: $sim,
                             created_at: $now,
                             valid_at: null,
                             invalid_at: null,
@@ -341,48 +476,20 @@ class Neo4jStorage(GraphStorage):
                         fact=_fact,
                         fact_embedding=_fact_emb,
                         episode_id=_episode_id,
+                        source=source,
+                        sim=simulation_id,
                         now=_now,
                     )
+                    return True
 
-                self._call_with_retry(session.execute_write, _create_relation)
+                if not self._call_with_retry(session.execute_write, _write_relation):
+                    merged += 1
+
+            if merged:
+                logger.info(f"[add_text] {merged} relations repeated an existing fact; episode added to it")
 
         logger.info(f"[add_text] Chunk done: episode={episode_id}")
         return episode_id
-
-    def add_text_batch(
-        self,
-        graph_id: str,
-        chunks: List[str],
-        batch_size: int = 3,
-        progress_callback: Optional[Callable] = None,
-    ) -> List[str]:
-        """Batch-add text chunks with progress reporting."""
-        episode_ids = []
-        total = len(chunks)
-
-        for i, chunk in enumerate(chunks):
-            if not chunk or not chunk.strip():
-                continue
-            episode_id = self.add_text(graph_id, chunk)
-            episode_ids.append(episode_id)
-
-            if progress_callback:
-                progress = (i + 1) / total
-                progress_callback(progress)
-
-            logger.info(f"Processed chunk {i + 1}/{total}")
-
-        return episode_ids
-
-    def wait_for_processing(
-        self,
-        episode_ids: List[str],
-        progress_callback: Optional[Callable] = None,
-        timeout: int = 600,
-    ) -> None:
-        """No-op — processing is synchronous in Neo4j."""
-        if progress_callback:
-            progress_callback(1.0)
 
     # ----------------------------------------------------------------
     # Read nodes
@@ -482,24 +589,26 @@ class Neo4jStorage(GraphStorage):
         query: str,
         limit: int = 10,
         scope: str = "edges",
+        simulation_id: Optional[str] = None,
     ):
         """
         Hybrid search — returns results matching the scope.
 
         Returns a dict with 'edges' and/or 'nodes' lists
         (callers like zep_tools will wrap into SearchResult).
+        simulation_id limits simulation facts to one run (see in_run_scope).
         """
         result = {"edges": [], "nodes": [], "query": query}
 
         with self._driver.session() as session:
             if scope in ("edges", "both"):
                 result["edges"] = self._search.search_edges(
-                    session, graph_id, query, limit
+                    session, graph_id, query, limit, simulation_id
                 )
 
             if scope in ("nodes", "both"):
                 result["nodes"] = self._search.search_nodes(
-                    session, graph_id, query, limit
+                    session, graph_id, query, limit, simulation_id
                 )
 
         return result
@@ -507,44 +616,6 @@ class Neo4jStorage(GraphStorage):
     # ----------------------------------------------------------------
     # Graph info
     # ----------------------------------------------------------------
-
-    def get_graph_info(self, graph_id: str) -> Dict[str, Any]:
-        def _read(tx):
-            # Count nodes
-            node_result = tx.run(
-                "MATCH (n:Entity {graph_id: $gid}) RETURN count(n) AS cnt",
-                gid=graph_id,
-            )
-            node_count = node_result.single()["cnt"]
-
-            # Count edges
-            edge_result = tx.run(
-                "MATCH ()-[r:RELATION {graph_id: $gid}]->() RETURN count(r) AS cnt",
-                gid=graph_id,
-            )
-            edge_count = edge_result.single()["cnt"]
-
-            # Distinct entity types
-            label_result = tx.run(
-                """
-                MATCH (n:Entity {graph_id: $gid})
-                UNWIND labels(n) AS lbl
-                WITH lbl WHERE lbl <> 'Entity'
-                RETURN DISTINCT lbl
-                """,
-                gid=graph_id,
-            )
-            entity_types = [record["lbl"] for record in label_result]
-
-            return {
-                "graph_id": graph_id,
-                "node_count": node_count,
-                "edge_count": edge_count,
-                "entity_types": entity_types,
-            }
-
-        with self._driver.session() as session:
-            return self._call_with_retry(session.execute_read, _read)
 
     def get_graph_data(self, graph_id: str) -> Dict[str, Any]:
         """
@@ -623,6 +694,9 @@ class Neo4jStorage(GraphStorage):
             "summary": props.get("summary", ""),
             "attributes": attributes,
             "created_at": props.get("created_at"),
+            # None on graphs built before provenance was recorded
+            "source": props.get("source"),
+            "simulation_ids": props.get("simulation_ids") or [],
         }
 
     @staticmethod
@@ -654,4 +728,7 @@ class Neo4jStorage(GraphStorage):
             "invalid_at": props.get("invalid_at"),
             "expired_at": props.get("expired_at"),
             "episode_ids": episode_ids,
+            # None on graphs built before provenance was recorded
+            "source": props.get("source"),
+            "simulation_id": props.get("simulation_id"),
         }

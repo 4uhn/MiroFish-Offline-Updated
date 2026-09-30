@@ -33,15 +33,8 @@ def create_app(config_class=Config):
 
     CORS(app, resources={r"/api/*": {"origins": "*"}})
 
-    # Initialize model router (logs tiered routing status)
-    from .utils.model_router import get_router
-    router = get_router()
     if should_log_startup:
-        if router.fast_available:
-            logger.info("Tiered models: fast=%s, quality=%s",
-                        router.fast_model_name, router.quality_model_name)
-        else:
-            logger.info("Single model: %s", router.quality_model_name)
+        logger.info("Model: %s", Config.LLM_MODEL_NAME)
 
     # Initialise Neo4jStorage singleton (DI via app.extensions)
     from .storage import Neo4jStorage

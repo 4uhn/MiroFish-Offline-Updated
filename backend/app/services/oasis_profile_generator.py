@@ -10,7 +10,6 @@ Improvements:
 
 import json
 import random
-import time
 from typing import Dict, Any, List, Optional
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -19,8 +18,10 @@ from openai import OpenAI
 
 from ..config import Config
 from ..utils.logger import get_logger
+from ..utils.llm_client import ollama_extra_body
 from .entity_reader import EntityNode
 from ..storage import GraphStorage
+from ..storage.graph_storage import SEED_ONLY
 
 logger = get_logger('mirofish.oasis_profile')
 
@@ -171,12 +172,6 @@ class OasisProfileGenerator:
         "expert", "faculty", "official", "journalist", "activist"
     ]
     
-    # Group/institutional entity types (require representative account personas)
-    GROUP_ENTITY_TYPES = [
-        "university", "governmentagency", "organization", "ngo", 
-        "mediaoutlet", "company", "institution", "group", "community"
-    ]
-    
     def __init__(
         self,
         api_key: Optional[str] = None,
@@ -305,12 +300,14 @@ class OasisProfileGenerator:
         comprehensive_query = f"All information, activities, events, relationships, and background about {entity_name}"
 
         try:
-            # Search edges (facts)
+            # Search edges (facts). Seed facts only: on a reused graph, earlier
+            # runs' agent claims would otherwise shape the new profiles.
             edge_results = self.storage.search(
                 graph_id=self.graph_id,
                 query=comprehensive_query,
                 limit=30,
-                scope="edges"
+                scope="edges",
+                simulation_id=SEED_ONLY,
             )
 
             all_facts = set()
@@ -326,7 +323,8 @@ class OasisProfileGenerator:
                 graph_id=self.graph_id,
                 query=comprehensive_query,
                 limit=20,
-                scope="nodes"
+                scope="nodes",
+                simulation_id=SEED_ONLY,
             )
 
             all_summaries = set()
@@ -434,10 +432,6 @@ class OasisProfileGenerator:
         """Determine if the entity is an individual type"""
         return entity_type.lower() in self.INDIVIDUAL_ENTITY_TYPES
     
-    def _is_group_entity(self, entity_type: str) -> bool:
-        """Determine if the entity is a group/institutional type"""
-        return entity_type.lower() in self.GROUP_ENTITY_TYPES
-    
     def _generate_profile_with_llm(
         self,
         entity_name: str,
@@ -478,6 +472,7 @@ class OasisProfileGenerator:
                         {"role": "user", "content": prompt}
                     ],
                     response_format={"type": "json_object"},
+                    extra_body=ollama_extra_body(self.base_url),
                     temperature=0.7 - (attempt * 0.1)  # Lower temperature on each retry
                     # Do not set max_tokens, let the LLM generate freely
                 )
@@ -526,7 +521,6 @@ class OasisProfileGenerator:
     
     def _fix_truncated_json(self, content: str) -> str:
         """Fix truncated JSON (output cut off by max_tokens limit)"""
-        import re
         
         # If JSON was truncated, try to close it
         content = content.strip()
@@ -785,10 +779,6 @@ Important:
                 "profession": entity_type,
                 "interested_topics": ["General", "Social Issues"],
             }
-    
-    def set_graph_id(self, graph_id: str):
-        """Set graph ID for graph retrieval"""
-        self.graph_id = graph_id
     
     def generate_profiles_from_entities(
         self,
@@ -1095,14 +1085,3 @@ Important:
             return "female"
         return "other"
     
-    # Keep old method name as alias for backward compatibility
-    def save_profiles_to_json(
-        self,
-        profiles: List[OasisAgentProfile],
-        file_path: str,
-        platform: str = "reddit"
-    ):
-        """[Deprecated] Please use the save_profiles() method"""
-        logger.warning("save_profiles_to_json is deprecated, please use the save_profiles method")
-        self.save_profiles(profiles, file_path, platform)
-

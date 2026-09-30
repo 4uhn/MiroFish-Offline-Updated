@@ -11,14 +11,30 @@ Core Retrieval Tools (Optimized):
 """
 
 import json
+import re
 from typing import Dict, Any, List, Optional
 from dataclasses import dataclass, field
 
+from ..config import Config
 from ..utils.logger import get_logger
 from ..utils.llm_client import LLMClient
 from ..storage import GraphStorage
+from ..storage.graph_storage import in_run_scope
 
 logger = get_logger('mirofish.graph_tools')
+
+# Graph content extracted from agents' posts during the run rather than from
+# the seed document (storage records source="simulation"). Run 10's agents
+# invented a "River Wye" and a "Civic Health Centre"; NER stored them next to
+# the seed facts and the report could not tell them apart.
+AGENT_CLAIM_TAG = "[agent claim]"
+
+
+def with_origin(text: str, source: Optional[str]) -> str:
+    """Prefix text that came from simulated agents' posts with AGENT_CLAIM_TAG."""
+    if text and source == "simulation":
+        return f"{AGENT_CLAIM_TAG} {text}"
+    return text
 
 
 @dataclass
@@ -44,7 +60,7 @@ class SearchResult:
         text_parts = [f"Search query: {self.query}", f"Found {self.total_count} relevant items"]
 
         if self.facts:
-            text_parts.append("\n### Relevant Facts:")
+            text_parts.append("\n### Relevant Facts (machine-extracted summaries of simulation activity: paraphrase them, never put them in quotation marks):")
             for i, fact in enumerate(self.facts, 1):
                 text_parts.append(f"{i}. {fact}")
 
@@ -59,6 +75,7 @@ class NodeInfo:
     labels: List[str]
     summary: str
     attributes: Dict[str, Any]
+    source: Optional[str] = None  # "document" or "simulation"; None on older graphs
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -66,13 +83,14 @@ class NodeInfo:
             "name": self.name,
             "labels": self.labels,
             "summary": self.summary,
-            "attributes": self.attributes
+            "attributes": self.attributes,
+            "source": self.source,
         }
 
     def to_text(self) -> str:
         """Convert to text format"""
         entity_type = next((la for la in self.labels if la not in ["Entity", "Node"]), "Unknown type")
-        return f"Entity: {self.name} (Type: {entity_type})\nSummary: {self.summary}"
+        return with_origin(f"Entity: {self.name} (Type: {entity_type})\nSummary: {self.summary}", self.source)
 
 
 @dataclass
@@ -90,12 +108,14 @@ class EdgeInfo:
     valid_at: Optional[str] = None
     invalid_at: Optional[str] = None
     expired_at: Optional[str] = None
+    source: Optional[str] = None  # "document" or "simulation"; None on older graphs
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "uuid": self.uuid,
             "name": self.name,
             "fact": self.fact,
+            "source": self.source,
             "source_node_uuid": self.source_node_uuid,
             "target_node_uuid": self.target_node_uuid,
             "source_node_name": self.source_node_name,
@@ -110,7 +130,7 @@ class EdgeInfo:
         """Convert to text format"""
         source = self.source_node_name or self.source_node_uuid[:8]
         target = self.target_node_name or self.target_node_uuid[:8]
-        base_text = f"Relationship: {source} --[{self.name}]--> {target}\nFact: {self.fact}"
+        base_text = f"Relationship: {source} --[{self.name}]--> {target}\nFact: {with_origin(self.fact, self.source)}"
 
         if include_temporal:
             valid_at = self.valid_at or "Unknown"
@@ -183,16 +203,16 @@ class InsightForgeResult:
                 text_parts.append(f"{i}. {sq}")
 
         if self.semantic_facts:
-            text_parts.append(f"\n### [Key Facts] (Please cite these verbatim in the report)")
+            text_parts.append(f"\n### [Key Facts] (machine-extracted summaries of simulation activity: paraphrase them, never put them in quotation marks)")
             for i, fact in enumerate(self.semantic_facts, 1):
-                text_parts.append(f'{i}. "{fact}"')
+                text_parts.append(f'{i}. {fact}')
 
         if self.entity_insights:
             text_parts.append(f"\n### [Core Entities]")
             for entity in self.entity_insights:
                 text_parts.append(f"- **{entity.get('name', 'Unknown')}** ({entity.get('type', 'Entity')})")
                 if entity.get('summary'):
-                    text_parts.append(f"  Summary: \"{entity.get('summary')}\"")
+                    text_parts.append(f"  Summary: {entity.get('summary')}")
                 if entity.get('related_facts'):
                     text_parts.append(f"  Related facts: {len(entity.get('related_facts', []))}")
 
@@ -248,14 +268,14 @@ class PanoramaResult:
         ]
 
         if self.active_facts:
-            text_parts.append(f"\n### [Currently Active Facts] (Simulation results verbatim)")
+            text_parts.append(f"\n### [Currently Active Facts] (machine-extracted summaries of simulation activity: paraphrase them, never put them in quotation marks)")
             for i, fact in enumerate(self.active_facts, 1):
-                text_parts.append(f'{i}. "{fact}"')
+                text_parts.append(f'{i}. {fact}')
 
         if self.historical_facts:
-            text_parts.append(f"\n### [Historical/Expired Facts] (Evolution records)")
+            text_parts.append(f"\n### [Historical/Expired Facts] (earlier extracted summaries, superseded; paraphrase only)")
             for i, fact in enumerate(self.historical_facts, 1):
-                text_parts.append(f'{i}. "{fact}"')
+                text_parts.append(f'{i}. {fact}')
 
         if self.all_nodes:
             text_parts.append(f"\n### [Entities Involved]")
@@ -353,6 +373,11 @@ class InterviewResult:
             "## In-Depth Interview Report",
             f"**Interview Topic:** {self.interview_topic}",
             f"**Interviews Conducted:** {self.interviewed_count} / {self.total_agents} simulated agents",
+            "These are answers agents gave when interviewed after the simulation, not posts they made "
+            "during it ([Twitter] and [Reddit] mark which platform's copy of the agent answered). An "
+            "answer is the agent's own account: report what it says the agent did or felt as its claim "
+            "(\"told interviewers it had...\"), not as an observed event, and credit quotes as "
+            "(Name, role, interview). Five answers are five views, not a measure of how widespread a view was.",
             "\n### Rationale for Interviewee Selection",
             self.selection_reasoning or "(Auto-selected)",
             "\n---",
@@ -367,8 +392,12 @@ class InterviewResult:
         else:
             text_parts.append("(No interview records)\n\n---")
 
-        text_parts.append("\n### Interview Summary and Key Insights")
-        text_parts.append(self.summary or "(No summary)")
+        # No LLM-written summary of the answers: in Run 13 the section writer
+        # paraphrased it in place of the transcripts, keeping its anonymous
+        # credits ("a council representative stated") and generalisations
+        # ("broad agreement") and losing the interview framing.
+        if self.summary:
+            text_parts.append(f"\n{self.summary}")
 
         return "\n".join(text_parts)
 
@@ -393,9 +422,20 @@ class GraphToolsService:
     - get_entity_summary - Get relationship summary for an entity
     """
 
-    def __init__(self, storage: GraphStorage, llm_client: Optional[LLMClient] = None):
+    def __init__(
+        self,
+        storage: GraphStorage,
+        llm_client: Optional[LLMClient] = None,
+        simulation_id: Optional[str] = None,
+    ):
         self.storage = storage
         self._llm_client = llm_client
+        # Run scope for every graph read: simulation facts from other runs of
+        # this graph stay out of the report (see in_run_scope). None = unscoped.
+        self.simulation_id = simulation_id
+        # simulation_id -> {agent_id: times interviewed}, so later report
+        # sections hear from agents earlier sections did not
+        self._interview_counts: Dict[str, Dict[int, int]] = {}
         logger.info("GraphToolsService initialized")
 
     @property
@@ -404,6 +444,10 @@ class GraphToolsService:
         if self._llm_client is None:
             self._llm_client = LLMClient()
         return self._llm_client
+
+    def _scoped(self, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Nodes or edges from a storage read, limited to this service's run scope."""
+        return [item for item in items if in_run_scope(item, self.simulation_id)]
 
     # ========== Basic Tools ==========
 
@@ -438,6 +482,7 @@ class GraphToolsService:
                 query=query,
                 limit=limit,
                 scope=scope,
+                simulation_id=self.simulation_id,
             )
 
             facts = []
@@ -456,7 +501,7 @@ class GraphToolsService:
                 if isinstance(edge, dict):
                     fact = edge.get('fact', '')
                     if fact:
-                        facts.append(fact)
+                        facts.append(with_origin(fact, edge.get('source')))
                     edges.append({
                         "uuid": edge.get('uuid', ''),
                         "name": edge.get('name', ''),
@@ -483,7 +528,7 @@ class GraphToolsService:
                     })
                     summary = node.get('summary', '')
                     if summary:
-                        facts.append(f"[{node.get('name', '')}]: {summary}")
+                        facts.append(with_origin(f"[{node.get('name', '')}]: {summary}", node.get('source')))
 
             logger.info(f"Search complete: found {len(facts)} relevant facts")
 
@@ -532,7 +577,7 @@ class GraphToolsService:
 
         try:
             if scope in ["edges", "both"]:
-                all_edges = self.storage.get_all_edges(graph_id)
+                all_edges = self._scoped(self.storage.get_all_edges(graph_id))
                 scored_edges = []
                 for edge in all_edges:
                     score = match_score(edge.get("fact", "")) + match_score(edge.get("name", ""))
@@ -544,7 +589,7 @@ class GraphToolsService:
                 for score, edge in scored_edges[:limit]:
                     fact = edge.get("fact", "")
                     if fact:
-                        facts.append(fact)
+                        facts.append(with_origin(fact, edge.get("source")))
                     edges_result.append({
                         "uuid": edge.get("uuid", ""),
                         "name": edge.get("name", ""),
@@ -554,7 +599,7 @@ class GraphToolsService:
                     })
 
             if scope in ["nodes", "both"]:
-                all_nodes = self.storage.get_all_nodes(graph_id)
+                all_nodes = self._scoped(self.storage.get_all_nodes(graph_id))
                 scored_nodes = []
                 for node in all_nodes:
                     score = match_score(node.get("name", "")) + match_score(node.get("summary", ""))
@@ -572,7 +617,7 @@ class GraphToolsService:
                     })
                     summary = node.get("summary", "")
                     if summary:
-                        facts.append(f"[{node.get('name', '')}]: {summary}")
+                        facts.append(with_origin(f"[{node.get('name', '')}]: {summary}", node.get('source')))
 
             logger.info(f"Local search complete: found {len(facts)} relevant facts")
 
@@ -591,7 +636,7 @@ class GraphToolsService:
         """Get all nodes in the graph"""
         logger.info(f"Getting all nodes for graph {graph_id}...")
 
-        raw_nodes = self.storage.get_all_nodes(graph_id)
+        raw_nodes = self._scoped(self.storage.get_all_nodes(graph_id))
 
         result = []
         for node in raw_nodes:
@@ -600,7 +645,8 @@ class GraphToolsService:
                 name=node.get("name", ""),
                 labels=node.get("labels", []),
                 summary=node.get("summary", ""),
-                attributes=node.get("attributes", {})
+                attributes=node.get("attributes", {}),
+                source=node.get("source"),
             ))
 
         logger.info(f"Retrieved {len(result)} nodes")
@@ -610,7 +656,7 @@ class GraphToolsService:
         """Get all edges in the graph (with temporal info)"""
         logger.info(f"Getting all edges for graph {graph_id}...")
 
-        raw_edges = self.storage.get_all_edges(graph_id)
+        raw_edges = self._scoped(self.storage.get_all_edges(graph_id))
 
         result = []
         for edge in raw_edges:
@@ -619,7 +665,8 @@ class GraphToolsService:
                 name=edge.get("name", ""),
                 fact=edge.get("fact", ""),
                 source_node_uuid=edge.get("source_node_uuid", ""),
-                target_node_uuid=edge.get("target_node_uuid", "")
+                target_node_uuid=edge.get("target_node_uuid", ""),
+                source=edge.get("source"),
             )
 
             if include_temporal:
@@ -647,7 +694,8 @@ class GraphToolsService:
                 name=node.get("name", ""),
                 labels=node.get("labels", []),
                 summary=node.get("summary", ""),
-                attributes=node.get("attributes", {})
+                attributes=node.get("attributes", {}),
+                source=node.get("source"),
             )
         except Exception as e:
             logger.error(f"Failed to get node detail: {str(e)}")
@@ -663,7 +711,7 @@ class GraphToolsService:
         logger.info(f"Getting edges for node {node_uuid[:8]}...")
 
         try:
-            raw_edges = self.storage.get_node_edges(node_uuid)
+            raw_edges = self._scoped(self.storage.get_node_edges(node_uuid))
 
             result = []
             for edge in raw_edges:
@@ -677,6 +725,7 @@ class GraphToolsService:
                     valid_at=edge.get("valid_at"),
                     invalid_at=edge.get("invalid_at"),
                     expired_at=edge.get("expired_at"),
+                    source=edge.get("source"),
                 ))
 
             logger.info(f"Found {len(result)} edges related to node")
@@ -695,7 +744,7 @@ class GraphToolsService:
         logger.info(f"Getting entities of type {entity_type}...")
 
         # Use optimized label-based query from storage
-        raw_nodes = self.storage.get_nodes_by_label(graph_id, entity_type)
+        raw_nodes = self._scoped(self.storage.get_nodes_by_label(graph_id, entity_type))
 
         result = []
         for node in raw_nodes:
@@ -704,7 +753,8 @@ class GraphToolsService:
                 name=node.get("name", ""),
                 labels=node.get("labels", []),
                 summary=node.get("summary", ""),
-                attributes=node.get("attributes", {})
+                attributes=node.get("attributes", {}),
+                source=node.get("source"),
             ))
 
         logger.info(f"Found {len(result)} entities of type {entity_type}")
@@ -1007,7 +1057,6 @@ Return the sub-question list in JSON format."""
 
         # Get all nodes
         all_nodes = self.get_all_nodes(graph_id)
-        node_map = {n.uuid: n for n in all_nodes}
         result.all_nodes = all_nodes
         result.total_nodes = len(all_nodes)
 
@@ -1024,18 +1073,15 @@ Return the sub-question list in JSON format."""
             if not edge.fact:
                 continue
 
-            source_name = node_map.get(edge.source_node_uuid, NodeInfo('', '', [], '', {})).name or edge.source_node_uuid[:8]
-            target_name = node_map.get(edge.target_node_uuid, NodeInfo('', '', [], '', {})).name or edge.target_node_uuid[:8]
-
             is_historical = edge.is_expired or edge.is_invalid
 
             if is_historical:
                 valid_at = edge.valid_at or "Unknown"
                 invalid_at = edge.invalid_at or edge.expired_at or "Unknown"
-                fact_with_time = f"[{valid_at} - {invalid_at}] {edge.fact}"
+                fact_with_time = f"[{valid_at} - {invalid_at}] {with_origin(edge.fact, edge.source)}"
                 historical_facts.append(fact_with_time)
             else:
-                active_facts.append(edge.fact)
+                active_facts.append(with_origin(edge.fact, edge.source))
 
         # Sort by relevance to the query
         query_lower = query.lower()
@@ -1084,26 +1130,77 @@ Return the sub-question list in JSON format."""
         logger.info(f"QuickSearch complete: {result.total_count} results")
         return result
 
-    @staticmethod
-    def _clean_tool_call_response(response: str) -> str:
-        """Clean JSON tool call wrappers from agent responses, extracting actual content."""
-        if not response or not response.strip().startswith('{'):
-            return response
+    _TOOL_CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*(?:</tool_call>|$)", re.DOTALL)
+    _TEXT_ARG_KEYS = ('content', 'text', 'body', 'message', 'reply', 'quote_content')
+
+    @classmethod
+    def _clean_tool_call_response(cls, response: str) -> str:
+        """Recover the agent's words from a reply written as a tool call.
+
+        Handles qwen3's <tool_call>{"name": ..., "arguments": {...}}</tool_call>
+        text and bare {"tool_name"/"name": ..., "arguments": {...}} JSON. Returns
+        the text argument if there is one, "" for a textless call such as
+        join_group, and the input unchanged when it is not a tool call.
+        """
+        if not response:
+            return ""
         text = response.strip()
-        if 'tool_name' not in text[:80]:
+        match = cls._TOOL_CALL_RE.search(text)
+        if match:
+            payload = match.group(1)
+        elif text.startswith('{') and ('"arguments"' in text[:200]):
+            payload = text
+        else:
             return response
-        import re as _re
+
         try:
-            data = json.loads(text)
-            if isinstance(data, dict) and 'arguments' in data:
-                for key in ('content', 'text', 'body', 'message', 'reply'):
-                    if key in data['arguments']:
-                        return str(data['arguments'][key])
-        except (json.JSONDecodeError, KeyError, TypeError):
-            match = _re.search(r'"content"\s*:\s*"((?:[^"\\]|\\.)*)"', text)
-            if match:
-                return match.group(1).replace('\\n', '\n').replace('\\"', '"')
-        return response
+            data = json.loads(payload)
+            args = data.get('arguments', {}) if isinstance(data, dict) else {}
+            if isinstance(args, str):
+                args = json.loads(args)
+            for key in cls._TEXT_ARG_KEYS:
+                if isinstance(args, dict) and args.get(key):
+                    return str(args[key]).strip()
+            return ""
+        except (json.JSONDecodeError, TypeError, AttributeError):
+            m = re.search(r'"(?:content|message|text)"\s*:\s*"((?:[^"\\]|\\.)*)"', payload)
+            if m:
+                return m.group(1).replace('\\n', '\n').replace('\\"', '"').strip()
+            return ""
+
+    @classmethod
+    def _extract_interview_text(cls, raw: Any) -> str:
+        """Turn an IPC interview result into the agent's answer text.
+
+        With no platform given, the result is {"platforms": {"twitter": {...},
+        "reddit": {...}}}; Run 8 passed str() of that whole dict to the summary.
+        Each platform's answer is cleaned, and the answers are joined with a
+        platform label.
+        """
+        if isinstance(raw, dict) and isinstance(raw.get('platforms'), dict):
+            parts = []
+            for platform, res in raw['platforms'].items():
+                answer = cls._clean_tool_call_response((res or {}).get('response') or '')
+                if answer.strip():
+                    parts.append(f"[{platform.capitalize()}] {answer.strip()}")
+            return "\n\n".join(parts)
+        if isinstance(raw, dict):
+            return cls._clean_tool_call_response(raw.get('response') or '').strip()
+        return cls._clean_tool_call_response(str(raw or '')).strip()
+
+    @staticmethod
+    def _normalise_for_quote_match(text: str) -> str:
+        text = text.replace('\u2019', "'").replace('\u2018', "'")
+        text = re.sub(r'[^a-z0-9\' ]+', ' ', text.lower())
+        return re.sub(r'\s+', ' ', text).strip()
+
+    @staticmethod
+    def _key_quotes(answer: str, limit: int = 2) -> List[str]:
+        """Verbatim sentences from an answer, for the report to cite."""
+        body = re.sub(r'^\[(Twitter|Reddit)\]\s*', '', answer, flags=re.MULTILINE)
+        sentences = re.split(r'(?<=[.!?])\s+', body)
+        picked = [s.strip() for s in sentences if len(s.split()) >= 6 and '?' not in s]
+        return picked[:limit]
 
     def interview_agents(
         self,
@@ -1127,11 +1224,15 @@ Return the sub-question list in JSON format."""
             )
 
         selected_agents, selected_indices, reasoning = self._select_agents_for_interview(
-            profiles, interview_requirement, simulation_requirement, max_agents
+            simulation_id, profiles, interview_requirement, simulation_requirement, max_agents
         )
+        counts = self._interview_counts.setdefault(simulation_id, {})
+        for agent_profile, agent_idx in zip(selected_agents, selected_indices):
+            aid = int(agent_profile.get("user_id", agent_idx))
+            counts[aid] = counts.get(aid, 0) + 1
 
         questions = custom_questions or self._generate_interview_questions(
-            interview_requirement, simulation_requirement, selected_agents
+            interview_requirement, simulation_requirement
         )
 
         interviews = []
@@ -1155,17 +1256,20 @@ Return the sub-question list in JSON format."""
                         timeout=120.0
                     )
                     if result.get("success"):
-                        raw = result.get("result", "")
-                        if isinstance(raw, dict):
-                            response_text = raw.get("response", str(raw))
-                        else:
-                            response_text = str(raw)
-                        response_text = self._clean_tool_call_response(response_text)
+                        response_text = self._extract_interview_text(result.get("result", ""))
+                        if not response_text:
+                            logger.warning(f"Interview with {agent_name} returned no answer text")
                 except Exception as e:
                     logger.warning(f"Live interview failed for {agent_name}: {e}")
 
             if not response_text:
-                response_text = f"[Simulation environment not available — {agent_name} could not be interviewed live.]"
+                if env_alive:
+                    response_text = f"[{agent_name} gave no usable answer to the interview.]"
+                else:
+                    response_text = f"[Simulation environment not available — {agent_name} could not be interviewed live.]"
+                key_quotes = []
+            else:
+                key_quotes = self._key_quotes(response_text)
 
             interview = AgentInterview(
                 agent_name=agent_name,
@@ -1173,10 +1277,9 @@ Return the sub-question list in JSON format."""
                 agent_bio=agent_bio,
                 question=combined_question,
                 response=response_text,
+                key_quotes=key_quotes,
             )
             interviews.append(interview)
-
-        summary = self._generate_interview_summary(interviews, interview_requirement)
 
         return InterviewResult(
             interview_topic=interview_requirement,
@@ -1184,7 +1287,6 @@ Return the sub-question list in JSON format."""
             selected_agents=[{"name": a.get("realname", a.get("name", "?")), "role": a.get("profession", "?")} for a in selected_agents],
             interviews=interviews,
             selection_reasoning=reasoning,
-            summary=summary,
             total_agents=len(profiles),
             interviewed_count=len(interviews)
         )
@@ -1233,51 +1335,88 @@ Return the sub-question list in JSON format."""
 
         return profiles
 
+    _MAX_INSTITUTIONS_PER_INTERVIEW = 2
+    _MAX_SAME_TYPE_PER_INTERVIEW = 2
+
     def _select_agents_for_interview(
         self,
+        simulation_id: str,
         profiles: List[Dict[str, Any]],
         interview_requirement: str,
         simulation_requirement: str,
         max_agents: int
     ) -> tuple:
-        """Use LLM to select agents for interview"""
+        """Pick interviewees: the LLM ranks by relevance, code enforces the mix.
+
+        In Run 9 the LLM picked the same four institutions plus one resident
+        for every section. Now each agent is shown as an institution or a
+        member of the public, with how much it wrote and how often it has
+        been interviewed; code then caps institutions and same-type agents
+        and prefers agents not yet interviewed.
+        """
+        from .agent_posts import AgentPostIndex, active_agent_ids, public_agent_ids
+
+        public_ids = public_agent_ids(simulation_id)
+        post_counts = AgentPostIndex.for_simulation(simulation_id).counts_by_agent()
+        interviewed = self._interview_counts.get(simulation_id, {})
+        types = self._agent_entity_types(simulation_id)
+
+        def agent_id(i: int) -> int:
+            return int(profiles[i].get("user_id", i))
+
+        # Only agents that did something: asked about their actions, an agent
+        # with none on record makes them up, whatever the prompt says.
+        active = active_agent_ids(simulation_id)
+        if active is None:
+            logger.warning(f"Interview selection: no platform DB for {simulation_id}; not filtering by activity")
+            candidates = list(range(len(profiles)))
+        else:
+            candidates = [i for i in range(len(profiles)) if agent_id(i) in active]
+            if len(candidates) < len(profiles):
+                logger.info(f"Interview selection: {len(profiles) - len(candidates)} of {len(profiles)} "
+                            f"agents took no action and are not interviewed")
+            if len(candidates) < max_agents:
+                logger.info(f"Interview selection: only {len(candidates)} active agents for {max_agents} slots")
 
         agent_summaries = []
-        for i, profile in enumerate(profiles):
-            summary = {
+        for i in candidates:
+            profile = profiles[i]
+            aid = agent_id(i)
+            agent_summaries.append({
                 "index": i,
-                "name": profile.get("realname", profile.get("username", f"Agent_{i}")),
+                "name": profile.get("name") or profile.get("realname") or profile.get("username", f"Agent_{i}"),
+                "kind": "member of the public" if aid in public_ids else "institution/official",
                 "profession": profile.get("profession", "Unknown"),
-                "bio": profile.get("bio", "")[:200],
-                "interested_topics": profile.get("interested_topics", [])
-            }
-            agent_summaries.append(summary)
+                "bio": profile.get("bio", "")[:160],
+                "posts_written": post_counts.get(aid, 0),
+                "times_interviewed": interviewed.get(aid, 0),
+            })
 
-        system_prompt = """You are a professional interview planning expert. Your task is to select the most suitable interviewees from a list of simulated agents based on the interview requirements. Respond in English only.
+        system_prompt = """You are planning interviews for a report on a simulated public-opinion event. Rank the agents who would give the most useful, varied first-person answers on the interview topic. Respond in English only.
 
-Selection criteria:
-1. The agent's identity/profession is relevant to the interview topic
-2. The agent may hold unique or valuable perspectives
-3. Select diverse viewpoints (e.g., supporters, opponents, neutral parties, professionals, etc.)
-4. Prioritize roles directly related to the event
+Ranking criteria:
+1. Relevance of the agent's position to the interview topic
+2. A mix of members of the public and institutions/officials, and of opposing views
+3. Agents who wrote more during the simulation have more to draw on
+4. Prefer agents with times_interviewed = 0 when they are comparably relevant
 
-Return in JSON format:
+Return JSON:
 {
-    "selected_indices": [list of selected agent indices],
-    "reasoning": "Explanation of selection rationale"
+    "ranked_indices": [agent indices, most suitable first, at least """ + str(max_agents * 2) + """ if available],
+    "reasoning": "One or two sentences on the mix you chose"
 }"""
 
-        user_prompt = f"""Interview requirements:
+        user_prompt = f"""Interview topic:
 {interview_requirement}
 
 Simulation background:
 {simulation_requirement if simulation_requirement else "Not provided"}
 
-Available agent list ({len(agent_summaries)} total):
-{json.dumps(agent_summaries, ensure_ascii=False, indent=2)}
+Agents ({len(agent_summaries)} total):
+{json.dumps(agent_summaries, ensure_ascii=False, indent=2)}"""
 
-Please select up to {max_agents} agents most suitable for interviewing, and explain the selection rationale."""
-
+        ranked: List[int] = []
+        reasoning = ""
         try:
             response = self.llm.chat_json(
                 messages=[
@@ -1286,54 +1425,91 @@ Please select up to {max_agents} agents most suitable for interviewing, and expl
                 ],
                 temperature=0.3
             )
-
-            selected_indices = response.get("selected_indices", [])[:max_agents]
-            reasoning = response.get("reasoning", "Automatically selected based on relevance")
-
-            selected_agents = []
-            valid_indices = []
-            for idx in selected_indices:
-                if 0 <= idx < len(profiles):
-                    selected_agents.append(profiles[idx])
-                    valid_indices.append(idx)
-
-            return selected_agents, valid_indices, reasoning
-
+            raw = response.get("ranked_indices") or response.get("selected_indices") or []
+            allowed = set(candidates)
+            ranked = [int(i) for i in raw if isinstance(i, (int, str)) and str(i).isdigit() and int(i) in allowed]
+            reasoning = response.get("reasoning", "")
         except Exception as e:
-            logger.warning(f"LLM agent selection failed, using default selection: {e}")
-            selected = profiles[:max_agents]
-            indices = list(range(min(max_agents, len(profiles))))
-            return selected, indices, "Using default selection strategy"
+            logger.warning(f"LLM interview ranking failed, ranking by activity instead: {e}")
+
+        # Agents the LLM did not rank follow, most active first
+        rest = sorted(
+            (i for i in candidates if i not in ranked),
+            key=lambda i: -post_counts.get(agent_id(i), 0),
+        )
+        order = list(dict.fromkeys(ranked)) + rest
+        # Stable sort: fewer interviews first, LLM rank within ties
+        order.sort(key=lambda i: interviewed.get(agent_id(i), 0))
+
+        chosen: List[int] = []
+        institutions = 0
+        per_type: Dict[str, int] = {}
+        for i in order:
+            aid = agent_id(i)
+            is_public = aid in public_ids
+            etype = types.get(aid, "")
+            if not is_public and institutions >= self._MAX_INSTITUTIONS_PER_INTERVIEW:
+                continue
+            if is_public and per_type.get(etype, 0) >= self._MAX_SAME_TYPE_PER_INTERVIEW:
+                continue
+            chosen.append(i)
+            institutions += 0 if is_public else 1
+            per_type[etype] = per_type.get(etype, 0) + 1
+            if len(chosen) >= max_agents:
+                break
+
+        logger.info(
+            f"Interview selection: {[profiles[i].get('name', i) for i in chosen]} "
+            f"({institutions} institution(s); LLM ranked {len(ranked)})"
+        )
+        return [profiles[i] for i in chosen], chosen, reasoning or "Ranked by relevance, mixed by agent type"
+
+    @staticmethod
+    def _agent_entity_types(simulation_id: str) -> Dict[int, str]:
+        import os
+        path = os.path.join(Config.OASIS_SIMULATION_DATA_DIR, simulation_id, "simulation_config.json")
+        try:
+            with open(path, encoding="utf-8") as f:
+                return {
+                    int(a["agent_id"]): str(a.get("entity_type", ""))
+                    for a in json.load(f).get("agent_configs", [])
+                }
+        except (OSError, ValueError, KeyError) as e:
+            logger.warning(f"Could not read agent types for {simulation_id}: {e}")
+            return {}
+
+    _ROLE_ADDRESS = re.compile(r'^\s*(as|for) (a|an|the) [^,?]{1,60},\s*', re.IGNORECASE)
 
     def _generate_interview_questions(
         self,
         interview_requirement: str,
         simulation_requirement: str,
-        selected_agents: List[Dict[str, Any]]
     ) -> List[str]:
-        """Use LLM to generate interview questions"""
+        """Generate one question list that every interviewee can answer.
 
-        agent_roles = [a.get("profession", "Unknown") for a in selected_agents]
+        The same questions go to residents and institutions alike. In Run 9 the
+        prompt listed interviewee roles and asked for role-specific questions,
+        which produced "As a journalist, ..." questions sent to the NHS and a
+        56% rate of answers opening with "As a ...". In Run 10 the questions
+        asked what interviewees saw or noticed, and 29 of 40 answers were
+        summaries of the feed, so the questions now ask for their own position.
+        """
+        system_prompt = """You are a research interviewer. Generate 3-4 interview questions on the topic. Respond in English only.
 
-        system_prompt = """You are a professional journalist/interviewer. Based on the interview requirements, generate 3-5 in-depth interview questions. Respond in English only.
+The SAME questions are put to every interviewee: residents, workers, journalists, companies and public bodies. So each question must make sense for any of them.
 
 Question requirements:
-1. Open-ended questions that encourage detailed answers
-2. Questions that may elicit different answers from different roles
-3. Cover multiple dimensions such as facts, opinions, and feelings
-4. Natural language, like a real interview
-5. Keep each question concise, under 50 words
-6. Ask directly, do not include background descriptions or prefixes
+1. Ask for the interviewee's own position, one of these per question: what they did or decided and why; who they hold responsible; whom they trust or distrust now and why; what they will do next
+2. Never ask what they saw, noticed, observed or heard others say, and never ask them to describe the public reaction
+3. Never address a role or group ("As a journalist...", "For the council...", "How do residents...")
+4. Use "you" and ask about their own actions and views
+5. Under 35 words each, no background preamble
 
-Return in JSON format: {"questions": ["question 1", "question 2", ...]}"""
+Return JSON: {"questions": ["question 1", "question 2", ...]}"""
 
-        user_prompt = f"""Interview requirements: {interview_requirement}
+        user_prompt = f"""Interview topic: {interview_requirement}
 
-Simulation background: {simulation_requirement if simulation_requirement else "Not provided"}
-
-Interviewee roles: {', '.join(agent_roles)}
-
-Please generate 3-5 interview questions."""
+Simulation background: {simulation_requirement if simulation_requirement else "Not provided"}"""
 
         try:
             response = self.llm.chat_json(
@@ -1343,65 +1519,23 @@ Please generate 3-5 interview questions."""
                 ],
                 temperature=0.5
             )
-
-            return response.get("questions", [f"What are your thoughts on {interview_requirement}?"])
-
+            questions = [q.strip() for q in response.get("questions", []) if isinstance(q, str) and q.strip()]
         except Exception as e:
             logger.warning(f"Failed to generate interview questions: {e}")
+            questions = []
+
+        if not questions:
             return [
-                f"What is your perspective on {interview_requirement}?",
-                "How does this affect you or the group you represent?",
-                "How do you think this issue should be resolved or improved?"
+                f"What did you do or decide about {interview_requirement}, and why?",
+                "Who do you hold responsible, and whom do you trust or distrust now?",
+                "What will you do next?",
             ]
 
-    def _generate_interview_summary(
-        self,
-        interviews: List[AgentInterview],
-        interview_requirement: str
-    ) -> str:
-        """Generate interview summary"""
-
-        if not interviews:
-            return "No interviews were completed"
-
-        interview_texts = []
-        for interview in interviews:
-            interview_texts.append(f"[{interview.agent_name} ({interview.agent_role})]\n{interview.response[:500]}")
-
-        system_prompt = """You are a professional news editor. Based on the responses from multiple interviewees, generate an interview summary. Respond in English only.
-
-Summary requirements:
-1. Distill the main viewpoints from all parties
-2. Identify areas of consensus and disagreement
-3. Highlight valuable quotes
-4. Remain objective and neutral, without favoring any party
-5. Keep it within 1000 words
-
-Formatting constraints (must follow):
-- Use plain text paragraphs, separated by blank lines
-- Do not use Markdown headings (e.g., #, ##, ###)
-- Do not use divider lines (e.g., ---, ***)
-- When quoting interviewees, use English quotation marks ""
-- You may use **bold** to highlight keywords, but do not use other Markdown syntax"""
-
-        user_prompt = f"""Interview topic: {interview_requirement}
-
-Interview content:
-{"".join(interview_texts)}
-
-Please generate an interview summary."""
-
-        try:
-            summary = self.llm.chat(
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                temperature=0.3,
-                max_tokens=800
-            )
-            return summary
-
-        except Exception as e:
-            logger.warning(f"Failed to generate interview summary: {e}")
-            return f"A total of {len(interviews)} interviewees were interviewed, including: " + ", ".join([i.agent_name for i in interviews])
+        cleaned = []
+        for q in questions:
+            stripped = self._ROLE_ADDRESS.sub('', q)
+            if stripped != q:
+                logger.warning(f"Interview question addressed a role; removed the address: {q[:80]}")
+                stripped = stripped[:1].upper() + stripped[1:]
+            cleaned.append(stripped)
+        return cleaned

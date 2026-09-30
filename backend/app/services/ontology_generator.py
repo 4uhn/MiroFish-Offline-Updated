@@ -90,6 +90,10 @@ B. **Specific types (8 types, designed based on the text content)**:
    - Design more specific types based on the key roles that appear in the text
    - Example: If the text involves an academic event, you might have `Student`, `Professor`, `University`
    - Example: If the text involves a business event, you might have `Company`, `CEO`, `Employee`
+   - A type is a CATEGORY that several entities could belong to, never one specific named entity.
+     Name types after the role, not the instance: a water utility called "Thames Water" is a
+     `WaterCompany`, not `ThamesWater`; "Leeds City Council" is a `LocalCouncil`, not `LeedsCityCouncil`.
+     The specific names belong in `examples`.
 
 **Why fallback types are needed**:
 - The text will contain various people, such as "elementary school teachers", "bystanders", "anonymous netizens"
@@ -164,13 +168,9 @@ class OntologyGenerator:
     Ontology Generator
     Analyzes text content and generates entity and relationship type definitions.
     """
-    
-    # Ontology generation needs a larger context window than post generation.
-    # 8192 tokens fits comfortably on M2 Pro 16GB with qwen3:8b.
-    ONTOLOGY_NUM_CTX = 8192
 
     def __init__(self, llm_client: Optional[LLMClient] = None):
-        self.llm_client = llm_client or LLMClient(num_ctx=self.ONTOLOGY_NUM_CTX)
+        self.llm_client = llm_client or LLMClient()
     
     def generate(
         self,
@@ -303,7 +303,7 @@ Based on the above content, design entity types and relationship types suitable 
 **Rules that MUST be followed**:
 1. You must output exactly 10 entity types
 2. The last 2 must be fallback types: Person (individual fallback) and Organization (organization fallback)
-3. The first 8 should be specific types designed based on the text content
+3. The first 8 should be specific types designed based on the text content. Each type is a category (e.g. WaterCompany, RegulatoryBody), never a single named organisation or person; put named entities in `examples`
 4. All entity types must be real-world agents that can post on social media, not abstract concepts
 5. Attribute names must NOT use reserved words like name, uuid, group_id — use full_name, org_name, etc. instead
 """

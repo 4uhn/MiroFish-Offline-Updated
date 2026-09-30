@@ -8,7 +8,6 @@ Uses Ollama's /api/embed endpoint for vector generation (768 dimensions).
 import time
 import logging
 from typing import List, Optional
-from functools import lru_cache
 
 import requests
 
@@ -201,4 +200,3 @@ class EmbeddingService:
 
 class EmbeddingError(Exception):
     """Raised when embedding generation fails."""
-    pass

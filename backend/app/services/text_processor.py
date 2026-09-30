@@ -1,15 +1,12 @@
-""""""
+"""
+Text preprocessing and chunking service.
+"""
 
-from typing import List, Optional
-from ..utils.file_parser import FileParser, split_text_into_chunks
+from typing import List
+from ..utils.file_parser import split_text_into_chunks
 
 class TextProcessor:
-    """"""
-    
-    @staticmethod
-    def extract_from_files(file_paths: List[str]) -> str:
-        """"""
-        return FileParser.extract_from_multiple(file_paths)
+    """Text processor"""
     
     @staticmethod
     def split_text(
@@ -17,12 +14,10 @@ class TextProcessor:
         chunk_size: int = 500,
         overlap: int = 50
     ) -> List[str]:
-        """"""
         return split_text_into_chunks(text, chunk_size, overlap)
     
     @staticmethod
     def preprocess_text(text: str) -> str:
-        """"""
         import re
         
 
@@ -37,12 +32,3 @@ class TextProcessor:
         
         return text.strip()
     
-    @staticmethod
-    def get_text_stats(text: str) -> dict:
-        """"""
-        return {
-            "total_chars": len(text),
-            "total_lines": text.count('\n') + 1,
-            "total_words": len(text.split()),
-        }
-

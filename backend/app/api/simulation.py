@@ -9,7 +9,7 @@ from ..config import Config
 from ..services.entity_reader import EntityReader
 from ..services.oasis_profile_generator import OasisProfileGenerator
 from ..services.simulation_manager import SimulationManager, SimulationStatus
-from ..services.simulation_runner import SimulationRunner, RunnerStatus
+from ..services.simulation_runner import SimulationRunner
 from ..utils.logger import get_logger
 from ..models.project import ProjectManager
 
@@ -222,7 +222,6 @@ def _check_simulation_prepared(simulation_id: str) -> tuple:
         prepared_statuses = ["ready", "preparing", "running", "completed", "stopped", "failed"]
         if status in prepared_statuses and config_generated:
             profiles_file = os.path.join(simulation_dir, "reddit_profiles.json")
-            config_file = os.path.join(simulation_dir, "simulation_config.json")
             
             profiles_count = 0
             if os.path.exists(profiles_file):
@@ -270,7 +269,6 @@ def prepare_simulation():
     import threading
     import os
     from ..models.task import TaskManager, TaskStatus
-    from ..config import Config
     
     try:
         data = request.get_json() or {}
@@ -346,7 +344,7 @@ def prepare_simulation():
                 enrich_with_edges=False
             )
             # Apply same MAX_AGENT_ENTITIES cap as prepare_simulation to avoid count mismatch (#16)
-            max_agents = int(os.environ.get('MAX_AGENT_ENTITIES', '15'))
+            max_agents = int(os.environ.get('MAX_AGENT_ENTITIES', '30'))
             preview_count = min(filtered_preview.filtered_count, max_agents)
             state.entities_count = preview_count
             state.entity_types = list(filtered_preview.entity_types)
@@ -586,10 +584,7 @@ def get_simulation(simulation_id: str):
             }), 404
         
         result = state.to_dict()
-        
-        if state.status == SimulationStatus.READY:
-            result["run_instructions"] = manager.get_run_instructions(simulation_id)
-        
+
         return jsonify({
             "success": True,
             "data": result
@@ -629,7 +624,6 @@ def list_simulations():
 
 def _get_report_id_for_simulation(simulation_id: str) -> str:
     import json
-    from datetime import datetime
     
     reports_dir = os.path.join(os.path.dirname(__file__), '../../uploads/reports')
     if not os.path.exists(reports_dir):
@@ -998,49 +992,6 @@ def download_simulation_config(simulation_id: str):
         }), 500
 
 
-@simulation_bp.route('/script/<script_name>/download', methods=['GET'])
-def download_simulation_script(script_name: str):
-    try:
-        scripts_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../scripts'))
-        
-        allowed_scripts = [
-            "run_twitter_simulation.py",
-            "run_reddit_simulation.py", 
-            "run_parallel_simulation.py",
-            "action_logger.py"
-        ]
-        
-        if script_name not in allowed_scripts:
-            return jsonify({
-                "success": False,
-                "error": f"Unknown script: {script_name}, available: {allowed_scripts}"
-            }), 400
-        
-        script_path = os.path.join(scripts_dir, script_name)
-        
-        if not os.path.exists(script_path):
-            return jsonify({
-                "success": False,
-                "error": f"Script not found: {script_name}"
-            }), 404
-        
-        return send_file(
-            script_path,
-            as_attachment=True,
-            download_name=script_name
-        )
-        
-    except Exception as e:
-        logger.error(f"Failed to download script: {e}")
-        return jsonify({
-            "success": False,
-            "error": str(e),
-            "traceback": traceback.format_exc()
-        }), 500
-
-
-# ============== Profile Generation ==============
-
 @simulation_bp.route('/generate-profiles', methods=['POST'])
 def generate_profiles():
     try:
@@ -1204,14 +1155,24 @@ def start_simulation():
                     "error": "Graph memory update requires a valid graph_id — ensure graph is built"
                 }), 400
             
+            storage = current_app.extensions.get('neo4j_storage')
+            if not storage:
+                return jsonify({
+                    "success": False,
+                    "error": "Graph memory update requires Neo4j storage — is Neo4j running?"
+                }), 503
+
             logger.info(f"Enabling graph memory update: simulation_id={simulation_id}, graph_id={graph_id}")
+        else:
+            storage = None
         
         run_state = SimulationRunner.start_simulation(
             simulation_id=simulation_id,
             platform=platform,
             max_rounds=max_rounds,
             enable_graph_memory_update=enable_graph_memory_update,
-            graph_id=graph_id
+            graph_id=graph_id,
+            storage=storage,
         )
         
         state.status = SimulationStatus.RUNNING

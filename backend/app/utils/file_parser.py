@@ -1,8 +1,7 @@
 """File parsing utilities — extract text from PDF, Markdown, and TXT files."""
 
-import os
 from pathlib import Path
-from typing import List, Optional
+from typing import List
 
 
 def _read_text_with_fallback(file_path: str) -> str:
@@ -85,21 +84,6 @@ class FileParser:
     def _extract_from_txt(file_path: str) -> str:
         return _read_text_with_fallback(file_path)
 
-    @classmethod
-    def extract_from_multiple(cls, file_paths: List[str]) -> str:
-        all_texts = []
-
-        for i, file_path in enumerate(file_paths, 1):
-            try:
-                text = cls.extract_text(file_path)
-                filename = Path(file_path).name
-                all_texts.append(f"=== Document {i}: {filename} ===\n{text}")
-            except Exception as e:
-                all_texts.append(f"=== Document {i}: {file_path} (extraction failed: {str(e)}) ===")
-
-        return "\n\n".join(all_texts)
-
-
 def split_text_into_chunks(
     text: str,
     chunk_size: int = 500,
@@ -125,6 +109,15 @@ def split_text_into_chunks(
         if chunk:
             chunks.append(chunk)
 
-        start = end - overlap if end < len(text) else len(text)
+        if end >= len(text):
+            break
+        # Start the overlap at a line/sentence boundary, or skip it. The overlap
+        # only repeats text the previous chunk already saw whole, so a partial
+        # start just hands NER fragments like "otham Gardens" for "Cotham Gardens".
+        window_start = max(end - overlap, start + 1)
+        window = text[window_start:end]
+        cuts = [window.find(sep) + len(sep) for sep in ('\n', '. ', '! ', '? ')
+                if 0 <= window.find(sep) < len(window) - len(sep)]
+        start = window_start + min(cuts) if cuts else end
 
     return chunks

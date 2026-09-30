@@ -14,21 +14,32 @@ from .embedding_service import EmbeddingService
 
 logger = logging.getLogger('mirofish.search')
 
-# Cypher for vector search on edges (facts)
+# Run scope (see graph_storage.in_run_scope): with $sim set, simulation facts
+# must come from that run. Graphs built before runs were tagged have no
+# simulation_id, so their simulation facts drop out of scoped reads.
+_EDGE_IN_SCOPE = """($sim IS NULL OR coalesce(relationship.source, 'document') <> 'simulation'
+       OR relationship.simulation_id = $sim)"""
+_NODE_IN_SCOPE = """($sim IS NULL OR coalesce(node.source, 'document') <> 'simulation'
+       OR $sim IN coalesce(node.simulation_ids, []))"""
+
+# Cypher for vector search on edges (facts). The index spans every graph, so
+# the nearest $candidates are filtered to this graph and run before the limit:
+# asking for only $limit neighbours left a graph holding a fifth of the
+# database with about a fifth of its results.
 _VECTOR_SEARCH_EDGES = """
-CALL db.index.vector.queryRelationships('fact_embedding', $limit, $query_vector)
+CALL db.index.vector.queryRelationships('fact_embedding', $candidates, $query_vector)
 YIELD relationship, score
-WHERE relationship.graph_id = $graph_id
-RETURN relationship AS r, score
+WHERE relationship.graph_id = $graph_id AND """ + _EDGE_IN_SCOPE + """
+RETURN relationship AS r, startNode(relationship).uuid AS src, endNode(relationship).uuid AS tgt, score
 ORDER BY score DESC
 LIMIT $limit
 """
 
 # Cypher for vector search on nodes (entities)
 _VECTOR_SEARCH_NODES = """
-CALL db.index.vector.queryNodes('entity_embedding', $limit, $query_vector)
+CALL db.index.vector.queryNodes('entity_embedding', $candidates, $query_vector)
 YIELD node, score
-WHERE node.graph_id = $graph_id
+WHERE node.graph_id = $graph_id AND """ + _NODE_IN_SCOPE + """
 RETURN node AS n, score
 ORDER BY score DESC
 LIMIT $limit
@@ -38,8 +49,8 @@ LIMIT $limit
 _FULLTEXT_SEARCH_EDGES = """
 CALL db.index.fulltext.queryRelationships('fact_fulltext', $query_text)
 YIELD relationship, score
-WHERE relationship.graph_id = $graph_id
-RETURN relationship AS r, score
+WHERE relationship.graph_id = $graph_id AND """ + _EDGE_IN_SCOPE + """
+RETURN relationship AS r, startNode(relationship).uuid AS src, endNode(relationship).uuid AS tgt, score
 ORDER BY score DESC
 LIMIT $limit
 """
@@ -48,7 +59,7 @@ LIMIT $limit
 _FULLTEXT_SEARCH_NODES = """
 CALL db.index.fulltext.queryNodes('entity_fulltext', $query_text)
 YIELD node, score
-WHERE node.graph_id = $graph_id
+WHERE node.graph_id = $graph_id AND """ + _NODE_IN_SCOPE + """
 RETURN node AS n, score
 ORDER BY score DESC
 LIMIT $limit
@@ -60,6 +71,8 @@ class SearchService:
 
     VECTOR_WEIGHT = 0.7
     KEYWORD_WEIGHT = 0.3
+    # Nearest neighbours fetched from the shared vector index before filtering
+    VECTOR_CANDIDATES = 500
 
     def __init__(self, embedding_service: EmbeddingService):
         self.embedding = embedding_service
@@ -70,6 +83,7 @@ class SearchService:
         graph_id: str,
         query: str,
         limit: int = 10,
+        simulation_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
         Search edges (facts/relations) using hybrid scoring.
@@ -80,12 +94,12 @@ class SearchService:
 
         # Vector search
         vector_results = self._run_edge_vector_search(
-            session, graph_id, query_vector, limit * 2
+            session, graph_id, query_vector, limit * 2, simulation_id
         )
 
         # Keyword search
         keyword_results = self._run_edge_keyword_search(
-            session, graph_id, query, limit * 2
+            session, graph_id, query, limit * 2, simulation_id
         )
 
         # Merge and rank
@@ -100,6 +114,7 @@ class SearchService:
         graph_id: str,
         query: str,
         limit: int = 10,
+        simulation_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
         Search nodes (entities) using hybrid scoring.
@@ -109,11 +124,11 @@ class SearchService:
         query_vector = self.embedding.embed(query)
 
         vector_results = self._run_node_vector_search(
-            session, graph_id, query_vector, limit * 2
+            session, graph_id, query_vector, limit * 2, simulation_id
         )
 
         keyword_results = self._run_node_keyword_search(
-            session, graph_id, query, limit * 2
+            session, graph_id, query, limit * 2, simulation_id
         )
 
         merged = self._merge_results(
@@ -121,8 +136,25 @@ class SearchService:
         )
         return merged
 
+    @staticmethod
+    def _edge_row(record) -> Dict[str, Any]:
+        """Edge properties plus its endpoints.
+
+        Endpoint UUIDs are not relationship properties, so returning only the
+        relationship left every search hit without a source or target, and
+        InsightForge printed its relationship chains with blank names.
+        """
+        return {
+            **dict(record["r"]),
+            "uuid": record["r"]["uuid"],
+            "source_node_uuid": record["src"],
+            "target_node_uuid": record["tgt"],
+            "_score": record["score"],
+        }
+
     def _run_edge_vector_search(
-        self, session: Neo4jSession, graph_id: str, query_vector: List[float], limit: int
+        self, session: Neo4jSession, graph_id: str, query_vector: List[float], limit: int,
+        simulation_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Run vector similarity search on edge fact_embedding."""
         try:
@@ -131,9 +163,11 @@ class SearchService:
                 graph_id=graph_id,
                 query_vector=query_vector,
                 limit=limit,
+                candidates=max(limit, self.VECTOR_CANDIDATES),
+                sim=simulation_id,
             )
             return [
-                {**dict(record["r"]), "uuid": record["r"]["uuid"], "_score": record["score"]}
+                self._edge_row(record)
                 for record in result
             ]
         except Exception as e:
@@ -141,7 +175,8 @@ class SearchService:
             return []
 
     def _run_edge_keyword_search(
-        self, session: Neo4jSession, graph_id: str, query: str, limit: int
+        self, session: Neo4jSession, graph_id: str, query: str, limit: int,
+        simulation_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Run fulltext (BM25) search on edge fact + name."""
         try:
@@ -152,9 +187,10 @@ class SearchService:
                 graph_id=graph_id,
                 query_text=safe_query,
                 limit=limit,
+                sim=simulation_id,
             )
             return [
-                {**dict(record["r"]), "uuid": record["r"]["uuid"], "_score": record["score"]}
+                self._edge_row(record)
                 for record in result
             ]
         except Exception as e:
@@ -162,7 +198,8 @@ class SearchService:
             return []
 
     def _run_node_vector_search(
-        self, session: Neo4jSession, graph_id: str, query_vector: List[float], limit: int
+        self, session: Neo4jSession, graph_id: str, query_vector: List[float], limit: int,
+        simulation_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Run vector similarity search on entity embedding."""
         try:
@@ -171,6 +208,8 @@ class SearchService:
                 graph_id=graph_id,
                 query_vector=query_vector,
                 limit=limit,
+                candidates=max(limit, self.VECTOR_CANDIDATES),
+                sim=simulation_id,
             )
             return [
                 {**dict(record["n"]), "uuid": record["n"]["uuid"], "_score": record["score"]}
@@ -181,7 +220,8 @@ class SearchService:
             return []
 
     def _run_node_keyword_search(
-        self, session: Neo4jSession, graph_id: str, query: str, limit: int
+        self, session: Neo4jSession, graph_id: str, query: str, limit: int,
+        simulation_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Run fulltext search on entity name + summary."""
         try:
@@ -191,6 +231,7 @@ class SearchService:
                 graph_id=graph_id,
                 query_text=safe_query,
                 limit=limit,
+                sim=simulation_id,
             )
             return [
                 {**dict(record["n"]), "uuid": record["n"]["uuid"], "_score": record["score"]}

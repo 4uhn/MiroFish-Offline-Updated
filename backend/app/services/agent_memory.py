@@ -12,7 +12,7 @@ Storage: in-memory dict per simulation, with optional SQLite persistence.
 import logging
 import sqlite3
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 logger = logging.getLogger('mirofish.agent_memory')
@@ -118,7 +118,9 @@ class AgentMemoryStore:
         return (
             "YOUR RECENT ACTIVITY (actions you took in previous rounds):\n"
             + "\n".join(lines)
-            + "\n\nUse this context to stay consistent with your past behavior."
+            + "\n\nKeep your views consistent with this, but do not repeat or rephrase "
+            "a post you already made. If you post again, say something new: react to "
+            "a new development, answer someone, or add a detail you have not mentioned."
         )
 
     def agent_count(self) -> int:
@@ -136,6 +138,8 @@ def _format_action(rec: ActionRecord) -> Optional[str]:
         return None
 
     if t == "LIKE_POST":
+        if rec.content_preview:
+            return f'Round {rec.round_num}: Upvoted a post: "{rec.content_preview}..."'
         return f"Round {rec.round_num}: Liked a post" + (
             f" (post #{rec.target_id})" if rec.target_id else ""
         )
@@ -144,12 +148,16 @@ def _format_action(rec: ActionRecord) -> Optional[str]:
             f" (post #{rec.target_id})" if rec.target_id else ""
         )
     if t == "LIKE_COMMENT":
+        if rec.content_preview:
+            return f'Round {rec.round_num}: Upvoted a comment: "{rec.content_preview}..."'
         return f"Round {rec.round_num}: Liked a comment"
     if t == "DISLIKE_COMMENT":
         return f"Round {rec.round_num}: Disliked a comment"
     if t == "FOLLOW":
         return f"Round {rec.round_num}: Followed user #{rec.target_id}"
     if t == "REPOST":
+        if rec.content_preview:
+            return f'Round {rec.round_num}: Reposted someone else\'s post: "{rec.content_preview}..."'
         return f"Round {rec.round_num}: Reposted a post" + (
             f" (post #{rec.target_id})" if rec.target_id else ""
         )

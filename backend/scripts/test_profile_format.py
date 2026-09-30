@@ -1,4 +1,9 @@
-""""""
+"""
+Test whether Profile format generation meets OASIS requirements
+Verification:
+1. Twitter Profile generates CSV format
+2. Reddit Profile generates detailed JSON format
+"""
 
 import os
 import sys
@@ -11,7 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app.services.oasis_profile_generator import OasisProfileGenerator, OasisAgentProfile
 
 def test_profile_formats():
-    """"""
+    """Test Profile format"""
     print("=" * 60)
     print("OASIS Profile")
     print("=" * 60)
@@ -71,10 +76,10 @@ def test_profile_formats():
             reader = csv.DictReader(f)
             rows = list(reader)
             
-        print(f"   : {twitter_path}")
-        print(f"   : {len(rows)}")
-        print(f"   : {list(rows[0].keys())}")
-        print(f"\n   (1):")
+        print(f"   File: {twitter_path}")
+        print(f"   Lines: {len(rows)}")
+        print(f"   Headers: {list(rows[0].keys())}")
+        print(f"\n   Sample data (Row 1):")
         for key, value in rows[0].items():
             print(f"     {key}: {value}")
         
@@ -83,9 +88,9 @@ def test_profile_formats():
                                    'friend_count', 'follower_count', 'statuses_count', 'created_at']
         missing = set(required_twitter_fields) - set(rows[0].keys())
         if missing:
-            print(f"\n   [] : {missing}")
+            print(f"\n   [Error] Missing fields: {missing}")
         else:
-            print(f"\n   [] ")
+            print(f"\n   [Pass] All required fields exist")
         
 
         print("\n2. Reddit Profile (JSON)")
@@ -96,10 +101,10 @@ def test_profile_formats():
         with open(reddit_path, 'r', encoding='utf-8') as f:
             reddit_data = json.load(f)
         
-        print(f"   : {reddit_path}")
-        print(f"   : {len(reddit_data)}")
-        print(f"   : {list(reddit_data[0].keys())}")
-        print(f"\n   (1):")
+        print(f"   File: {reddit_path}")
+        print(f"   Number of entries: {len(reddit_data)}")
+        print(f"   Fields: {list(reddit_data[0].keys())}")
+        print(f"\n   Sample data (Item 1):")
         print(json.dumps(reddit_data[0], ensure_ascii=False, indent=4))
         
 
@@ -108,19 +113,19 @@ def test_profile_formats():
         
         missing = set(required_reddit_fields) - set(reddit_data[0].keys())
         if missing:
-            print(f"\n   [] : {missing}")
+            print(f"\n   [Error] Missing required fields: {missing}")
         else:
-            print(f"\n   [] ")
+            print(f"\n   [Pass] All required fields exist")
         
         present_optional = set(optional_reddit_fields) & set(reddit_data[0].keys())
-        print(f"   [] : {present_optional}")
+        print(f"   [Info] Optional fields: {present_optional}")
     
     print("\n" + "=" * 60)
-    print("!")
+    print("Test completed!")
     print("=" * 60)
 
 def show_expected_formats():
-    """"""
+    """Show OASIS expected format"""
     print("\n" + "=" * 60)
     print("OASIS Profile")
     print("=" * 60)

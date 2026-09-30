@@ -6,7 +6,24 @@ Current implementation: Neo4jStorage (neo4j_storage.py).
 """
 
 from abc import ABC, abstractmethod
-from typing import Dict, Any, List, Optional, Callable
+from typing import Dict, Any, List, Optional
+
+# Run scope for reads that must see no simulation facts at all, such as
+# building agent profiles before this graph's next run.
+SEED_ONLY = "__seed_only__"
+
+
+def in_run_scope(item: Dict[str, Any], simulation_id: Optional[str]) -> bool:
+    """True when a node or edge dict belongs in a read scoped to simulation_id.
+
+    Seed facts are always in scope. Simulation facts are in scope only for the
+    run that wrote them (edges carry simulation_id, nodes the simulation_ids
+    that mentioned them). simulation_id=None means unscoped.
+    """
+    if simulation_id is None or item.get("source") != "simulation":
+        return True
+    return (item.get("simulation_id") == simulation_id
+            or simulation_id in (item.get("simulation_ids") or []))
 
 
 class GraphStorage(ABC):
@@ -33,33 +50,20 @@ class GraphStorage(ABC):
     # --- Add data ---
 
     @abstractmethod
-    def add_text(self, graph_id: str, text: str) -> str:
+    def add_text(
+        self,
+        graph_id: str,
+        text: str,
+        source: str = "document",
+        simulation_id: Optional[str] = None,
+        grounding: Optional[List[Dict[str, Any]]] = None,
+    ) -> str:
         """
         Process text: NER/RE → create nodes/edges → return episode_id.
         This is synchronous (unlike Zep Cloud's async episodes).
-        """
-
-    @abstractmethod
-    def add_text_batch(
-        self,
-        graph_id: str,
-        chunks: List[str],
-        batch_size: int = 3,
-        progress_callback: Optional[Callable] = None,
-    ) -> List[str]:
-        """Batch-add text chunks. Returns list of episode_ids."""
-
-    @abstractmethod
-    def wait_for_processing(
-        self,
-        episode_ids: List[str],
-        progress_callback: Optional[Callable] = None,
-        timeout: int = 600,
-    ) -> None:
-        """
-        Wait for episodes to be processed.
-        For Neo4j: no-op (synchronous processing).
-        Kept for API compatibility with Zep-era callers.
+        source is "document" (seed text) or "simulation" (agent activity).
+        simulation_id tags what a run writes. grounding (one item per agent
+        activity: actor, own_words, acted_on) limits what NER may record.
         """
 
     # --- Read nodes ---
@@ -95,6 +99,7 @@ class GraphStorage(ABC):
         query: str,
         limit: int = 10,
         scope: str = "edges",
+        simulation_id: Optional[str] = None,
     ):
         """
         Hybrid search (vector + keyword) over graph data.
@@ -104,16 +109,14 @@ class GraphStorage(ABC):
             query: Search query text
             limit: Max results
             scope: "edges", "nodes", or "both"
+            simulation_id: Limit simulation facts to this run (see in_run_scope);
+                SEED_ONLY excludes them all, None applies no run filter
 
         Returns:
             Dict with 'edges' and/or 'nodes' lists (wrapped by GraphToolsService into SearchResult)
         """
 
     # --- Graph info ---
-
-    @abstractmethod
-    def get_graph_info(self, graph_id: str) -> Dict[str, Any]:
-        """Get graph metadata (node count, edge count, entity types)."""
 
     @abstractmethod
     def get_graph_data(self, graph_id: str) -> Dict[str, Any]:

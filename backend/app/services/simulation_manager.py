@@ -12,11 +12,10 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 
-from ..config import Config
 from ..utils.logger import get_logger
-from .entity_reader import EntityReader, FilteredEntities, EntityNode
+from .entity_reader import EntityReader, select_agent_entities
 from .oasis_profile_generator import OasisProfileGenerator, OasisAgentProfile
-from .simulation_config_generator import SimulationConfigGenerator, SimulationParameters
+from .simulation_config_generator import SimulationConfigGenerator
 from .agent_archetypes import generate_synthetic_personas
 
 logger = get_logger('mirofish.simulation')
@@ -31,11 +30,6 @@ class SimulationStatus(str, Enum):
     STOPPED = "stopped"
     COMPLETED = "completed"
     FAILED = "failed"
-
-
-class PlatformType(str, Enum):
-    TWITTER = "twitter"
-    REDDIT = "reddit"
 
 
 @dataclass
@@ -238,7 +232,7 @@ class SimulationManager:
             if progress_callback:
                 progress_callback(
                     "reading", 100, 
-                    f"complete，{filtered.filtered_count} Entity",
+                    f"Completed, total {filtered.filtered_count} entities",
                     current=filtered.filtered_count,
                     total=filtered.filtered_count
                 )
@@ -251,13 +245,16 @@ class SimulationManager:
 
             # Cap institutional entities (leave room for synthetic personas)
             MAX_AGENT_ENTITIES = int(os.environ.get('MAX_AGENT_ENTITIES', '30'))
-            max_institutional = min(8, len(filtered.entities))  # Cap institutions, prioritize synthetic individuals
-            if len(filtered.entities) > max_institutional:
-                logger.info(
-                    f"Capping institutional entities from {len(filtered.entities)} to {max_institutional}"
-                )
-                filtered.entities = filtered.entities[:max_institutional]
-                filtered.filtered_count = len(filtered.entities)
+            max_institutional = 8  # Cap institutions, prioritize synthetic individuals
+            n_before = len(filtered.entities)
+            filtered.entities = select_agent_entities(
+                filtered.entities, max_institutional, requirement=simulation_requirement
+            )
+            filtered.filtered_count = len(filtered.entities)
+            logger.info(
+                f"Selected {filtered.filtered_count}/{n_before} institutional entities: "
+                f"{[e.name for e in filtered.entities]}"
+            )
 
             # Extract location from knowledge graph entities
             graph_locations = reader.get_location_names(state.graph_id)
@@ -410,7 +407,7 @@ class SimulationManager:
             if progress_callback:
                 progress_callback(
                     "generating_profiles", 100, 
-                    f"complete，{len(profiles)} Profile",
+                    f"Completed, total {len(profiles)} Profiles",
                     current=len(profiles),
                     total=len(profiles)
                 )
@@ -528,26 +525,3 @@ class SimulationManager:
         
         with open(config_path, 'r', encoding='utf-8') as f:
             return json.load(f)
-    
-    def get_run_instructions(self, simulation_id: str) -> Dict[str, str]:
-        sim_dir = self._get_simulation_dir(simulation_id)
-        config_path = os.path.join(sim_dir, "simulation_config.json")
-        scripts_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../scripts'))
-        
-        return {
-            "simulation_dir": sim_dir,
-            "scripts_dir": scripts_dir,
-            "config_file": config_path,
-            "commands": {
-                "twitter": f"python {scripts_dir}/run_twitter_simulation.py --config {config_path}",
-                "reddit": f"python {scripts_dir}/run_reddit_simulation.py --config {config_path}",
-                "parallel": f"python {scripts_dir}/run_parallel_simulation.py --config {config_path}",
-            },
-            "instructions": (
-                f"1. condaconda activate MiroFish\n"
-                f"2. Simulation ({scripts_dir}):\n"
-                f"   - Twitter: python {scripts_dir}/run_twitter_simulation.py --config {config_path}\n"
-                f"   - Reddit: python {scripts_dir}/run_reddit_simulation.py --config {config_path}\n"
-                f"   - python {scripts_dir}/run_parallel_simulation.py --config {config_path}"
-            )
-        }

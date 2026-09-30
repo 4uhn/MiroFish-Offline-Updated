@@ -11,10 +11,10 @@ Features:
 
 import os
 import json
-import time
 import re
-from typing import Dict, Any, List, Optional, Callable
-from dataclasses import dataclass, field
+from collections import Counter
+from typing import Dict, Any, List, Optional, Callable, Tuple
+from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 
@@ -22,11 +22,7 @@ from ..config import Config
 from ..utils.llm_client import LLMClient
 from ..utils.logger import get_logger
 from .graph_tools import (
-    GraphToolsService,
-    SearchResult,
-    InsightForgeResult,
-    PanoramaResult,
-    InterviewResult
+    GraphToolsService
 )
 
 logger = get_logger('mirofish.report_agent')
@@ -117,17 +113,6 @@ class ReportLogger:
             details={"message": "Starting report outline planning"}
         )
 
-    def log_planning_context(self, context: Dict[str, Any]):
-        """Record context information obtained during planning"""
-        self.log(
-            action="planning_context",
-            stage="planning",
-            details={
-                "message": "Retrieved simulation context information",
-                "context": context
-            }
-        )
-
     def log_planning_complete(self, outline_dict: Dict[str, Any]):
         """Record outline planning completion"""
         self.log(
@@ -149,20 +134,6 @@ class ReportLogger:
             details={"message": f"Starting section generation: {section_title}"}
         )
 
-    def log_react_thought(self, section_title: str, section_index: int, iteration: int, thought: str):
-        """Record ReACT reasoning process"""
-        self.log(
-            action="react_thought",
-            stage="generating",
-            section_title=section_title,
-            section_index=section_index,
-            details={
-                "iteration": iteration,
-                "thought": thought,
-                "message": f"ReACT iteration {iteration} reasoning"
-            }
-        )
-    
     def log_tool_call(
         self,
         section_title: str,
@@ -486,9 +457,10 @@ This is our powerful retrieval function, designed for in-depth analysis. It will
 - Need to gather rich material to support report sections
 
 [Returns]
-- Relevant original facts (can be quoted directly)
+- Extracted facts (machine summaries: paraphrase, never quote)
 - Core entity insights
-- Relationship chain analysis"""
+- Relationship chain analysis
+- What agents actually wrote on the topic (verbatim posts/comments: quotable)"""
 
 TOOL_DESC_PANORAMA_SEARCH = """\
 [Broad Search - Get full panoramic view]
@@ -503,9 +475,10 @@ This tool retrieves the complete overview of simulation results, especially suit
 - Need comprehensive entity and relationship information
 
 [Returns]
-- Currently valid facts (latest simulation results)
+- Currently valid facts (machine summaries: paraphrase, never quote)
 - Historical/expired facts (evolution records)
-- All involved entities"""
+- All involved entities
+- What agents actually wrote on the topic (verbatim posts/comments: quotable)"""
 
 TOOL_DESC_QUICK_SEARCH = """\
 [Simple Search - Quick retrieval]
@@ -517,7 +490,21 @@ A lightweight, fast retrieval tool suitable for simple, direct information queri
 - Simple information retrieval
 
 [Returns]
-- List of facts most relevant to the query"""
+- List of facts most relevant to the query (machine summaries: paraphrase, never quote)
+- What agents actually wrote on the topic (verbatim posts/comments: quotable)"""
+
+TOOL_DESC_SIMULATION_STATS = """\
+[Simulation Statistics - counts of what agents wrote]
+Counts the posts, quotes and comments agents wrote: totals, members of the public
+versus institutions, the most active authors, and for each keyword how many texts
+and agents mention it.
+
+[Use Cases]
+- Before writing that a view spread, gained traction, dominated or was rare: check how many agents wrote about it
+- Need the size of the discussion or who drove it
+
+[Returns]
+- Counts only (nothing quotable)"""
 
 TOOL_DESC_INTERVIEW_AGENTS = """\
 [In-depth Interview - Real Agent Interview (dual platform)]
@@ -527,10 +514,9 @@ By default, interviews are conducted simultaneously on both Twitter and Reddit p
 
 Workflow:
 1. Automatically reads persona files to understand all simulation Agents
-2. Intelligently selects Agents most relevant to the interview topic (e.g., students, media, officials)
-3. Automatically generates interview questions
+2. Selects a mix of members of the public and institutions, favouring agents not yet interviewed
+3. Automatically generates questions that every interviewee answers
 4. Calls the /api/simulation/interview/batch endpoint to conduct real interviews on both platforms
-5. Integrates all interview results to provide multi-perspective analysis
 
 [Use Cases]
 - Need to understand event perspectives from different roles (What do students think? What does the media say? What is the official stance?)
@@ -542,7 +528,6 @@ Workflow:
 - Identity information of interviewed Agents
 - Each Agent's interview responses on both Twitter and Reddit platforms
 - Key quotes (can be quoted directly)
-- Interview summary and perspective comparison
 
 [Important] The OASIS simulation environment must be running to use this feature!"""
 
@@ -569,6 +554,11 @@ Write a "Future Prediction Report" that answers:
 - This is NOT an analysis of the current real world
 - This is NOT a generic opinion summary
 
+[Titles and Scope - the outline is written before any evidence is gathered]
+- Each section title names a question or topic the report will examine, never its answer. The requirement asks "whether the warnings gain traction": the title is "Response to the Campaigners' 2019 Warnings", not "Campaigners' Warnings Gain Traction". Not "Anger Surges", not "Anxiety Outpaces Reassurance".
+- The summary says in one sentence what the report examines. It states no findings: those are written after the sections.
+- The measured counts below show what agents actually wrote about. A topic with 0 texts still gets examined if the requirement asks about it, under a neutral title.
+
 [Section Count Limits]
 - Minimum 2 sections, maximum 5 sections
 - No sub-sections needed — each section should contain complete content
@@ -578,16 +568,40 @@ Write a "Future Prediction Report" that answers:
 Output a JSON-formatted report outline in the following format:
 {
     "title": "Report Title",
-    "summary": "Report summary (one sentence summarizing the core predictive findings)",
+    "summary": "One sentence saying what the report examines (no findings)",
     "sections": [
         {
-            "title": "Section Title",
-            "description": "Section content description"
+            "title": "Section title naming a question, not an answer",
+            "description": "What the section will examine"
         }
     ]
 }
 
 Note: The sections array must have at least 2 and at most 5 elements!"""
+
+# Constrains outline decoding: json_object mode alone let qwen3 emit
+# section objects without a "title" key, producing untitled sections.
+OUTLINE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "title": {"type": "string"},
+        "summary": {"type": "string"},
+        "sections": {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 5,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "description": {"type": "string"},
+                },
+                "required": ["title", "description"],
+            },
+        },
+    },
+    "required": ["title", "summary", "sections"],
+}
 
 PLAN_USER_PROMPT_TEMPLATE = """\
 [Prediction Scenario]
@@ -602,6 +616,7 @@ The variable injected into the simulation world (simulation requirement): {simul
 [Sample Future Facts Predicted by the Simulation]
 {related_facts_json}
 
+{measured_counts}
 Examine this future rehearsal from a "god's eye view":
 1. Under the conditions we set, what state did the future present?
 2. How did different groups (Agents) react and act?
@@ -619,14 +634,15 @@ You are an expert in writing "Future Prediction Reports," and you are currently 
 Respond in English only. Write the report in English.
 
 Report Title: {report_title}
-Report Summary: {report_summary}
+Report scope: {report_summary}
 Prediction Scenario (Simulation Requirement): {simulation_requirement}
 
+{measured_counts}
 Current section to write: {section_title}
 
-═══════════════════════════════════════════════════════════════
+==========
 [Core Concept]
-═══════════════════════════════════════════════════════════════
+==========
 
 The simulation world is a rehearsal of the future. We injected specific conditions (simulation requirements) into the simulation world. The behavior and interactions of Agents in the simulation are predictions of future human behavior.
 
@@ -638,9 +654,9 @@ Your task is to:
 Do NOT write this as an analysis of the current real world.
 Focus on "what the future would look like" — the simulation results ARE the predicted future.
 
-═══════════════════════════════════════════════════════════════
+==========
 [Most Important Rules - Must Follow]
-═══════════════════════════════════════════════════════════════
+==========
 
 1. [You MUST call tools to observe the simulation world]
    - You are observing the future rehearsal from a "god's eye view"
@@ -648,11 +664,16 @@ Focus on "what the future would look like" — the simulation results ARE the pr
    - Do NOT use your own knowledge to write report content
    - Each section must call tools at least 3 times (maximum 5) to observe the simulated world, which represents the future
 
-2. [You MUST quote Agents' original statements and behavior]
-   - Agent statements and behavior are predictions of future human behavior
-   - Use block quote format to present these predictions in the report, for example:
-     > "A certain group would say: original content..."
-   - These quotes are the core evidence of simulation predictions
+2. [Quote only what agents actually said]
+   - Two things are quotable: interview answers, and entries under "What agents actually wrote". Copy them word for word and name the speaker.
+   - Everything else in tool results (facts, entity summaries, relationship chains) is a machine-written summary. Paraphrase it in your own sentences; never put it in quotation marks or a > block quote.
+   - A fact marked [agent claim] was extracted from what simulated agents posted, not from the source document. Report it as something agents said or believed ("several residents claimed..."), never as an established fact.
+   - An interview answer is that agent's own account. Report what it says the agent did or believes as its claim ("Persimmon Homes told interviewers it had..."), not as something that happened, and credit its quotes with "interview" in place of a platform. A handful of interviewees is not a measure of how common a view was.
+   - Use at most 6 block quotes per section, each a different speaker or point, and never repeat a quote already used in a completed section. Weave the rest into prose.
+   - Quote any one speaker at most 2 times in the whole report; the checker removes further quotes from them. Give the space to other voices.
+   - Block quote format, for example:
+     > "<exact words from an interview answer or agent post>" (Speaker name, role, platform or "interview")
+   - Every quote is checked against the tool output after you finish; a quote that is not word for word is turned into plain text
 
 3. [Language Consistency - All content must be in English]
    - Tool results may contain content in various languages
@@ -666,36 +687,36 @@ Focus on "what the future would look like" — the simulation results ARE the pr
    - NEVER invent social media platforms (e.g., Facebook, Instagram, TikTok) or channels unless they explicitly appeared in tool results.
    - NEVER create fictional quotes from agents who did not appear in tool results. Only quote agents whose exact words were returned by tools.
    - If a tool returns limited or no relevant data for a topic, say so honestly: "The simulation data on this aspect was limited" — do NOT fill gaps with plausible-sounding invented content.
+   - Claims of spread, reach or change ("gained traction", "spread rapidly", "widely shared", "many residents", "trust fluctuated", "growing distrust") need a measured basis: cite the count (e.g. "3 of 80 texts, by 3 agents") from the measured counts or simulation_stats, or a comparison of what agents wrote early and late in the run. Without one, report what the named agents said and state that the data is thin.
    - When quoting an agent, use ONLY their actual words from tool results. Do not paraphrase loosely or embellish.
+   - Do not start a quote or sentence with the speaker announcing their role ("As a journalist, ..."); cut to the substance with "..." if needed.
    - If you are unsure whether something came from a tool result, DO NOT include it.
+   - Write about the simulated world, never about your research: do not mention tools, searches, search terms, "the texts" or "the data". When the measured counts show agents did not discuss a topic, say plainly that they did not, and do not then suggest it was referenced or implied.
+   - The section title names the question this section answers, not the answer. Let the evidence decide what you conclude, even when it is "agents barely discussed this".
 
-═══════════════════════════════════════════════════════════════
+==========
 [Format Requirements - Extremely Important!]
-═══════════════════════════════════════════════════════════════
+==========
 
 [One section = smallest content unit]
 - Each section is the smallest unit of the report
 - Do NOT use any Markdown headings (#, ##, ###, #### etc.) within sections
 - Do NOT add the section title at the beginning of the content
 - Section titles are added automatically by the system — you only need to write the body text
-- Use **bold text**, paragraph breaks, block quotes, and lists to organize content, but do NOT use headings
+- Organise content with paragraph breaks, block quotes, lists and a few bolded key phrases inside sentences, but do NOT use headings
 
 [Correct Example]
 ```
-This section analyzes the public opinion dynamics of the event. Through in-depth analysis of simulation data, we found...
+<opening sentence answering the section's question, with a count from the measured counts where one applies>
 
-**Initial Outbreak Phase**
+**<key phrase>** <sentence about what named agents wrote or told interviewers>:
 
-Social media served as the primary channel for information dissemination:
+> "<exact words from an agent post>" (Speaker name, role, platform)
 
-> "Social media contributed 68% of the initial discussion volume..."
+<sentence on a second view, from a different agent>:
 
-**Sentiment Amplification Phase**
-
-Video platforms further amplified the event's impact:
-
-- Strong visual impact
-- High emotional resonance
+- <point supported by a tool result>
+- <another point supported by a tool result>
 ```
 
 [Incorrect Example]
@@ -707,9 +728,9 @@ Video platforms further amplified the event's impact:
 This section analyzes...
 ```
 
-═══════════════════════════════════════════════════════════════
+==========
 [Available Retrieval Tools] (call 3-5 times per section)
-═══════════════════════════════════════════════════════════════
+==========
 
 {tools_description}
 
@@ -718,10 +739,11 @@ This section analyzes...
 - panorama_search: Wide-angle panoramic search, understand the full picture, timeline, and evolution of events
 - quick_search: Quickly verify a specific data point
 - interview_agents: Interview simulation Agents, get first-person perspectives and real reactions from different roles
+- simulation_stats: Count how many agents wrote about something; check this before saying a view spread, gained traction or dominated
 
-═══════════════════════════════════════════════════════════════
+==========
 [Workflow]
-═══════════════════════════════════════════════════════════════
+==========
 
 Each reply you can only do ONE of the following two things (not both):
 
@@ -740,14 +762,14 @@ Strictly prohibited:
 - Do NOT fabricate tool results (Observations) — all tool results are injected by the system
 - Call at most one tool per reply
 
-═══════════════════════════════════════════════════════════════
+==========
 [Section Content Requirements]
-═══════════════════════════════════════════════════════════════
+==========
 
 1. Content must be based on simulation data retrieved via tools
-2. Extensively quote original text to demonstrate simulation results
+2. Support points with agents' own words (interview answers and agent posts only, at most 6 block quotes), and paraphrase extracted facts
 3. Use Markdown formatting (but no headings):
-   - Use **bold text** to mark key points (instead of sub-headings)
+   - Bold a few key phrases inside sentences (instead of sub-headings); never write a sentence about the formatting itself
    - Use lists (- or 1. 2. 3.) to organize points
    - Use blank lines to separate paragraphs
    - Do NOT use #, ##, ###, #### or any heading syntax
@@ -756,11 +778,11 @@ Strictly prohibited:
 
    Correct format:
    ```
-   The response was considered lacking in substance.
+   <sentence introducing the quote>
 
-   > "The response appeared rigid and slow in the fast-changing social media environment."
+   > "<exact words from an interview answer or agent post>" (Speaker name, role, platform or "interview")
 
-   This assessment reflects widespread public dissatisfaction.
+   <sentence following it up>
    ```
 
    Incorrect format:
@@ -769,15 +791,15 @@ Strictly prohibited:
    ```
 5. Maintain logical coherence with other sections
 6. [Avoid Repetition] Carefully read the completed sections below and do not repeat the same information
-7. [Emphasis] Do NOT add any headings! Use **bold text** instead of sub-headings"""
+7. [Emphasis] Do NOT add any headings! Bold key phrases inside sentences instead of sub-headings"""
 
 SECTION_USER_PROMPT_TEMPLATE = """\
 Completed sections (read carefully to avoid repetition):
 {previous_content}
 
-═══════════════════════════════════════════════════════════════
+==========
 [Current Task] Write section: {section_title}
-═══════════════════════════════════════════════════════════════
+==========
 
 [Important Reminders]
 1. Carefully read the completed sections above to avoid repeating the same content!
@@ -789,7 +811,7 @@ Completed sections (read carefully to avoid repetition):
 - Do NOT write any headings (#, ##, ###, #### are all prohibited)
 - Do NOT write "{section_title}" as the opening line
 - Section titles are added automatically by the system
-- Write body text directly, use **bold text** instead of sub-headings
+- Write body text directly, bolding key phrases inside sentences instead of sub-headings
 
 Begin:
 1. First, think (Thought) about what information this section needs
@@ -804,11 +826,11 @@ Observation (retrieval results):
 === Tool {tool_name} returned ===
 {result}
 
-═══════════════════════════════════════════════════════════════
+==========
 Tools called {tool_calls_count}/{max_tool_calls} times (used: {used_tools_str}){unused_hint}
-- If you have enough information: output section content starting with "Final Answer:" (must quote the original text above)
+- If you have enough information: output section content starting with "Final Answer:" (quote only interview answers and agent posts above, word for word)
 - If you need more information: call a tool to continue retrieval
-═══════════════════════════════════════════════════════════════"""
+=========="""
 
 REACT_INSUFFICIENT_TOOLS_MSG = (
     "[Notice] You have only called tools {tool_calls_count} times — at least {min_tool_calls} calls are required. "
@@ -882,11 +904,29 @@ class ReportAgent:
     # Maximum tool calls per section
     MAX_TOOL_CALLS_PER_SECTION = 5
 
-    # Maximum reflection rounds
-    MAX_REFLECTION_ROUNDS = 3
-
     # Maximum tool calls per chat turn
     MAX_TOOL_CALLS_PER_CHAT = 2
+
+    # Tokens kept free for each section-writing reply. Run 12's longest
+    # section was 2,957 chars (~750 tokens).
+    SECTION_REPLY_TOKENS = 1536
+    # Chars per token until the server reports a prompt's token count
+    # (deliberately low: a low guess trims more, never overflows)
+    DEFAULT_CHARS_PER_TOKEN = 3.0
+    # Highest chars/token taken from a measurement. When a chat exceeds
+    # num_ctx, Ollama drops whole older messages (logged only at debug level)
+    # and reports the tokens of what was left, so an overfull prompt measures
+    # implausibly sparse: Run 13 section 4 read ~5.8, with its task gone.
+    # Measured on qwen3: the section system prompt, the densest part, is 4.68
+    # (it was 4.4 with its 63-char '═' rules at 32 tokens each); trimmed
+    # section prompts, mostly system prompt, 4.70-4.81.
+    MAX_CHARS_PER_TOKEN = 4.6
+    # A measurement above this means messages were almost certainly dropped
+    # (interview transcripts, the sparsest part measured, are 5.5)
+    DROPPED_MESSAGES_CHARS_PER_TOKEN = 5.6
+    # Share of the prompt budget used, for content that tokenizes denser
+    # than the prompt the chars-per-token figure was measured on
+    CONTEXT_SAFETY = 0.95
     
     def __init__(
         self,
@@ -908,18 +948,34 @@ class ReportAgent:
         """
         self.graph_id = graph_id
         self.simulation_id = simulation_id
+        # Words agents actually said that this section's tools returned
+        # (interview answers, agent posts); the only text a section may quote
+        self._section_quotable: List[str] = []
+        # (speaker, text) for each quotable text, to check who a quote is credited to
+        self._section_speakers: List[Tuple[str, str]] = []
         self.simulation_requirement = simulation_requirement
 
-        self.llm = llm_client or LLMClient(num_ctx=8192)
+        self.llm = llm_client or LLMClient()
+        # Measured from the server's prompt_tokens after each section call
+        self._chars_per_token = self.DEFAULT_CHARS_PER_TOKEN
         if graph_tools is None:
             raise ValueError(
                 "graph_tools (GraphToolsService) is required. "
                 "Create it via GraphToolsService(storage=...) and pass it in."
             )
+        if graph_tools.simulation_id != simulation_id:
+            # An unscoped service would mix other runs' agent claims into this report
+            raise ValueError(
+                f"graph_tools is scoped to {graph_tools.simulation_id!r}, not {simulation_id!r}. "
+                "Create it via GraphToolsService(storage=..., simulation_id=...)."
+            )
         self.graph_tools = graph_tools
         
         # Tool definitions
         self.tools = self._define_tools()
+        # Mention counts for what the requirement asks about (_measure_requirement)
+        self._measured_counts = ""
+        # Requirement keywords no agent text contains
 
         # Logger (initialized in generate_report)
         self.report_logger: Optional[ReportLogger] = None
@@ -955,6 +1011,13 @@ class ReportAgent:
                     "limit": "Number of results to return (optional, default 10)"
                 }
             },
+            "simulation_stats": {
+                "name": "simulation_stats",
+                "description": TOOL_DESC_SIMULATION_STATS,
+                "parameters": {
+                    "keywords": "Comma-separated words or phrases to count mentions of (optional, up to 10)"
+                }
+            },
             "interview_agents": {
                 "name": "interview_agents",
                 "description": TOOL_DESC_INTERVIEW_AGENTS,
@@ -965,6 +1028,222 @@ class ReportAgent:
             }
         }
     
+    MAX_REQUIREMENT_KEYWORDS = 10
+
+    def _measure_requirement(self) -> str:
+        """Mention counts for the topics the simulation requirement asks about.
+
+        Run 11's report said the campaigners' 2019 warnings "were referenced
+        in discussions"; no agent text mentioned 2019, a warning or a
+        petition. The writer had the simulation_stats tool but never asked it.
+        These counts are measured once and given to every section, so the
+        report's answers to the requirement's own questions rest on them.
+        """
+        from .agent_posts import AgentPostIndex
+        prompt = f"""Simulation requirement:
+{self.simulation_requirement}
+
+List up to {self.MAX_REQUIREMENT_KEYWORDS} search terms that a social media post would contain if it discussed one of the things this requirement asks to observe. Cover every question or topic it names, including organisations and past events.
+- Each term is ONE word, or one organisation's name. A term matches words that start with it, so use the shortest form: "warn" matches warned and warnings, "apolog" matches apology and apologise.
+- Use words a post would actually contain ("2019", "petition", "apolog", "Persimmon"), never labels or combinations ("public sentiment", "Persimmon blame").
+
+Return JSON: {{"keywords": ["...", "..."]}}"""
+        try:
+            result = self.llm.chat_json(
+                messages=[
+                    {"role": "system", "content": "You pick search terms. Respond in English only. Return pure JSON."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.2,
+            )
+            keywords = [k.strip() for k in result.get("keywords", []) if isinstance(k, str) and k.strip()]
+        except Exception as e:
+            logger.warning(f"Could not pick requirement keywords, sections get no measured counts: {e}")
+            return ""
+        keywords = list(dict.fromkeys(keywords))[:self.MAX_REQUIREMENT_KEYWORDS]
+        if not keywords:
+            logger.warning("No requirement keywords returned, sections get no measured counts")
+            return ""
+        stats = AgentPostIndex.for_simulation(self.simulation_id).stats_text(keywords)
+        logger.info(f"Measured requirement keywords: {keywords}")
+        return (
+            "Measured in the simulation (counts of what agents wrote, for the questions above). "
+            "Words in 0 texts were never used by an agent: say so plainly, and never describe them as "
+            "mentioned, referenced or gaining traction. Cite a count with its own unit "
+            "(\"8 texts by 5 agents, 3 of them public agents\"), never \"3 public texts\".\n" + stats + "\n"
+        )
+
+    AGENT_POSTS_PER_SEARCH = 6
+
+    def _agent_posts_block(self, query: str) -> str:
+        """Verbatim agent posts/comments matching the query, appended to search tool output.
+
+        Graph facts are NER paraphrases; these are the words agents wrote, and
+        with interview answers they are the only text a section may quote.
+        """
+        from .agent_posts import AgentPostIndex
+        try:
+            posts = AgentPostIndex.for_simulation(self.simulation_id).search(query, k=self.AGENT_POSTS_PER_SEARCH)
+        except Exception as e:
+            logger.warning(f"Agent post lookup failed for {self.simulation_id}: {e}")
+            posts = []
+        if not posts:
+            return "\n\n### What agents actually wrote\n(No agent posts matched this query.)"
+        self._section_quotable.extend(p.content for p in posts)
+        self._section_speakers.extend((p.name, p.content) for p in posts)
+        lines = [
+            "\n\n### What agents actually wrote "
+            "(verbatim posts/comments: quote word for word and name the speaker)"
+        ]
+        lines += [f"{i}. {p.to_text()}" for i, p in enumerate(posts, 1)]
+        return "\n".join(lines)
+
+    _QUOTE_OPEN = '"\u201c'
+    _QUOTE_CLOSE = '"\u201d'
+
+    _INLINE_QUOTE = re.compile(r'["“]([^"“”\n]+)["”]')
+
+    @staticmethod
+    def _sentences(line: str) -> List[str]:
+        """A prose line's sentences, with their leading spaces; never split inside a quote."""
+        out, start, inside, n = [], 0, False, len(line)
+        for i, ch in enumerate(line):
+            # "... the crisis.** While" ends after the bold marker
+            j = i + 1
+            while j < n and line[j] == '*':
+                j += 1
+            # 'wrote: "... failed to pro..." indicating a lack' goes on
+            k = j
+            while k < n and line[k].isspace():
+                k += 1
+            ends = (j == n or line[j].isspace()) and not (k < n and line[k].islower())
+            if ch == '“' or (ch == '"' and not inside):
+                inside = True
+            elif ch == '”' or (ch == '"' and inside):
+                inside = False
+                # tweeted: "... in their blood?" This sentiment ...
+                if ends and i > 0 and line[i - 1] in '.!?':
+                    out.append(line[start:j])
+                    start = j
+            elif not inside and ch in '.!?' and ends:
+                out.append(line[start:j])
+                start = j
+        out.append(line[start:])
+        return [s for s in out if s.strip()]
+
+    @classmethod
+    def _drop_unverified_inline(cls, text: str, corpus: str) -> Tuple[str, int]:
+        """Remove each sentence with an inline quote of four or more words
+        that is not word for word in corpus (normalised agent texts).
+
+        Until Run 13 such a quote only lost its quotation marks, so "As one
+        resident put it, Trust is hard to rebuild once it's broken" stayed in
+        the report: words no agent wrote, still credited to a resident.
+        """
+        norm = GraphToolsService._normalise_for_quote_match
+
+        def verified(quoted: str) -> bool:
+            parts = [p for p in re.split(r'\.\.\.|…', quoted) if p.strip()]
+            return len(quoted.split()) < 4 or all(norm(p) in corpus for p in parts)
+
+        dropped = 0
+        lines = []
+        for line in text.split("\n"):
+            sentences = cls._sentences(line)
+            kept = [s for s in sentences
+                    if all(verified(m.group(1)) for m in cls._INLINE_QUOTE.finditer(s))]
+            if len(kept) < len(sentences):
+                dropped += len(sentences) - len(kept)
+                line = "".join(kept).strip()
+            lines.append(line)
+        return "\n".join(lines), dropped
+
+    @classmethod
+    def _verify_quotes(cls, content: str, sources: List[str],
+                       speakers: Optional[List[Tuple[str, str]]] = None) -> tuple:
+        """Keep only quotes that are agents' own words, credited to their author.
+
+        In Run 9 a section block-quoted ~40 graph facts (NER paraphrases such
+        as "Kwame Patel responded ... by demanding accountability") as if
+        agents had said them. A block quote is kept only if its text (each
+        part, when elided with "...") is word for word in an interview answer
+        or agent post this section's tools returned; otherwise it is removed.
+        A sentence with an inline "..." quote that fails the same check is
+        removed too (_drop_unverified_inline).
+
+        speakers lists (name, text) for the sources. Run 11 credited Oliver
+        Taylor's post, word for word, to Tom Patel. When a block quote's
+        attribution names one of the speakers, one of the texts containing
+        the quote must be theirs, or the quote is removed.
+        """
+        norm = GraphToolsService._normalise_for_quote_match
+        corpus = " \n ".join(norm(s) for s in sources)
+        stats = {"kept": 0, "dropped": 0, "misattributed": 0, "inline_dropped": 0}
+        # "Drinking Water Inspectorate (DWI)" is also credited without the acronym
+        speaker_texts = [
+            (re.sub(r"\s*\([^)]*\)", "", name).strip().lower(), norm(text))
+            for name, text in (speakers or []) if name
+        ]
+        known_names = {name for name, _ in speaker_texts if name}
+
+        def misattributed(quoted: str, credit: str) -> bool:
+            credit = credit.lower()
+            named = {n for n in known_names if re.search(rf"\b{re.escape(n)}\b", credit)}
+            parts = [norm(p) for p in re.split(r'\.\.\.|\u2026', quoted) if len(p.split()) >= 3]
+            authors = {n for n, t in speaker_texts if all(p in t for p in parts)}
+            return bool(named) and not (named & authors)
+
+        def verbatim(text: str) -> bool:
+            parts = [p for p in re.split(r'\.\.\.|\u2026', text) if len(p.split()) >= 3]
+            return bool(parts) and all(norm(p) in corpus for p in parts)
+
+        def split_quote(body: str) -> tuple:
+            """(lead-in, quoted text, trailing attribution) of a block quote body.
+
+            Handles `"text" (Name)` and `**Name:** "text"`; a body without
+            quotation marks is treated as all quoted text.
+            """
+            body = body.strip()
+            starts = [k for k in (body.find(c) for c in cls._QUOTE_OPEN) if k >= 0]
+            if starts:
+                start = min(starts)
+                end = max(body.rfind(c) for c in cls._QUOTE_CLOSE)
+                if end > start:
+                    return body[:start].strip(), body[start + 1:end].strip(), body[end + 1:].strip()
+            return "", body, ""
+
+        out: List[str] = []
+        prose: List[str] = []
+
+        def flush_prose():
+            if prose:
+                text, n = cls._drop_unverified_inline("\n".join(prose), corpus)
+                stats["inline_dropped"] += n
+                out.append(text)
+                prose.clear()
+
+        for line in content.split("\n"):
+            if not line.lstrip().startswith(">"):
+                prose.append(line)
+                continue
+            # Each > line is checked on its own: the model often stacks several
+            # quotes, from different sources, in one block
+            flush_prose()
+            body = line.lstrip()[1:].strip()
+            lead, quoted, attribution = split_quote(body)
+            if len(quoted.split()) < 4:
+                out.append(f"> {body}" if body else ">")
+            elif not verbatim(quoted):
+                stats["dropped"] += 1
+            elif misattributed(quoted, f"{lead} {attribution}"):
+                stats["misattributed"] += 1
+            else:
+                stats["kept"] += 1
+                out.append(f"\n> {body}\n")
+        flush_prose()
+        content = "\n".join(out)
+        return re.sub(r'\n{3,}', '\n\n', content), stats
+
     def _execute_tool(self, tool_name: str, parameters: Dict[str, Any], report_context: str = "") -> str:
         """
         Execute a tool call
@@ -998,7 +1277,7 @@ class ReportAgent:
                     simulation_requirement=self.simulation_requirement,
                     report_context=ctx
                 )
-                return result.to_text()
+                return result.to_text() + self._agent_posts_block(query)
 
             elif tool_name == "panorama_search":
                 query = parameters.get("query", "") or ""
@@ -1013,7 +1292,7 @@ class ReportAgent:
                     query=query,
                     include_expired=include_expired
                 )
-                return result.to_text()
+                return result.to_text() + self._agent_posts_block(query)
 
             elif tool_name == "quick_search":
                 query = parameters.get("query", "") or ""
@@ -1028,7 +1307,7 @@ class ReportAgent:
                     query=query,
                     limit=limit
                 )
-                return result.to_text()
+                return result.to_text() + self._agent_posts_block(query)
             
             elif tool_name == "interview_agents":
                 # In-depth interview - call real OASIS interview API to get simulation Agent responses (dual platform)
@@ -1043,8 +1322,20 @@ class ReportAgent:
                     simulation_requirement=self.simulation_requirement,
                     max_agents=max_agents
                 )
+                # Failed interviews carry a bracketed placeholder, not agent words
+                answered = [i for i in result.interviews
+                            if not re.match(r'\[(?!Twitter\]|Reddit\])', i.response)]
+                self._section_quotable.extend(i.response for i in answered)
+                self._section_speakers.extend((i.agent_name, i.response) for i in answered)
                 return result.to_text()
-            
+
+            elif tool_name == "simulation_stats":
+                from .agent_posts import AgentPostIndex
+                keywords = parameters.get("keywords", "")
+                if isinstance(keywords, str):
+                    keywords = keywords.split(",")
+                return AgentPostIndex.for_simulation(self.simulation_id).stats_text(keywords)
+
             # ========== Backward-compatible legacy tools (internally redirected to new tools) ==========
             
             elif tool_name == "search_graph":
@@ -1080,14 +1371,14 @@ class ReportAgent:
                 return json.dumps(result, ensure_ascii=False, indent=2)
             
             else:
-                return f"Unknown tool: {tool_name}. Please use one of: insight_forge, panorama_search, quick_search"
+                return f"Unknown tool: {tool_name}. Please use one of: {', '.join(sorted(self.VALID_TOOL_NAMES))}"
                 
         except Exception as e:
             logger.error(f"Tool execution failed: {tool_name}, error: {str(e)}")
             return f"Tool execution failed: {str(e)}"
     
     # Valid tool name set, used for validation during bare JSON fallback parsing
-    VALID_TOOL_NAMES = {"insight_forge", "panorama_search", "quick_search", "interview_agents"}
+    VALID_TOOL_NAMES = {"insight_forge", "panorama_search", "quick_search", "interview_agents", "simulation_stats"}
 
     def _parse_tool_calls(self, response: str) -> List[Dict[str, Any]]:
         """
@@ -1196,6 +1487,7 @@ class ReportAgent:
             entity_types=list(context.get('graph_statistics', {}).get('entity_types', {}).keys()),
             total_entities=context.get('total_entities', 0),
             related_facts_json=json.dumps(context.get('related_facts', [])[:10], ensure_ascii=False, indent=2),
+            measured_counts=self._measured_counts,
         )
 
         try:
@@ -1204,7 +1496,9 @@ class ReportAgent:
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}
                 ],
-                temperature=0.3
+                temperature=0.3,
+                schema=OUTLINE_SCHEMA,
+                schema_name="report_outline",
             )
             
             if progress_callback:
@@ -1243,6 +1537,210 @@ class ReportAgent:
                 ]
             )
     
+    _LIST_ITEM = re.compile(r"^\s*(?:\d+\.|-)\s")
+    _OMITTED = re.compile(r"^\((\d+) more omitted to fit the context window\)$")
+
+    @classmethod
+    def _drop_list_items(cls, text: str, need: int) -> Tuple[str, int]:
+        """Remove items from the end of the longest list in text, until `need` chars are gone.
+
+        One item of each list is kept, and a note says how many were
+        omitted. Returns the new text and the chars removed (0 when no list
+        has an item to spare).
+        """
+        lines = text.split("\n")
+        blocks, start = [], None
+        for i in range(len(lines) + 1):
+            if i < len(lines) and cls._LIST_ITEM.match(lines[i]):
+                if start is None:
+                    start = i
+            elif start is not None:
+                if i - start > 1:
+                    blocks.append((start, i))
+                start = None
+        if not blocks:
+            return text, 0
+        first, end = max(blocks, key=lambda b: b[1] - b[0])
+        # A list trimmed before already ends in a note; fold the counts together
+        note = cls._OMITTED.match(lines[end]) if end < len(lines) else None
+        omitted = int(note.group(1)) if note else 0
+        tail_end = end + 1 if note else end
+        cut = end
+        removed = 0
+        while cut > first + 1 and removed < need:
+            cut -= 1
+            removed += len(lines[cut]) + 1
+        omitted += end - cut
+        lines[cut:tail_end] = [f"({omitted} more omitted to fit the context window)"]
+        new_text = "\n".join(lines)
+        return new_text, len(text) - len(new_text)
+
+    _INTERVIEW = re.compile(r"(?=\n#### Interview #\d+: )")
+    _INTERVIEWS_OMITTED = re.compile(r"\n\((\d+) more interviews omitted to fit the context window\)\s*$")
+    _SECTION_OMITTED = "(rest of this section omitted to fit the context window)"
+    PREVIOUS_SECTIONS_SEP = "\n\n---\n\n"
+
+    @classmethod
+    def _drop_interviews(cls, text: str, need: int) -> Tuple[str, int]:
+        """Remove whole interviews from the end of an interview_agents result.
+
+        Interviewees are listed in selection order, so the least relevant go
+        first. One interview is always kept, and a note says how many were
+        omitted. Returns the new text and the chars removed.
+        """
+        note = cls._INTERVIEWS_OMITTED.search(text)
+        omitted = int(note.group(1)) if note else 0
+        body = text[:note.start()] if note else text
+        blocks = cls._INTERVIEW.split(body)
+        # blocks[0] is the header; each later block is one interview
+        if len(blocks) <= 2:
+            return text, 0
+        removed = 0
+        while len(blocks) > 2 and removed < need:
+            removed += len(blocks.pop())
+            omitted += 1
+        new_text = "".join(blocks) + f"\n({omitted} more interviews omitted to fit the context window)"
+        return new_text, len(text) - len(new_text)
+
+    @classmethod
+    def _drop_paragraphs(cls, text: str, need: int) -> Tuple[str, int]:
+        """Shorten the longest completed section in the previous-sections text.
+
+        Paragraphs go from the end; each section keeps its heading and first
+        paragraph. Returns the new text and the chars removed.
+        """
+        sections = [sec.split("\n\n") for sec in text.split(cls.PREVIOUS_SECTIONS_SEP)]
+        # Sections shortened before end in a note; set it aside while counting
+        noted = {i for i, paras in enumerate(sections) if paras[-1] == cls._SECTION_OMITTED}
+        for i in noted:
+            sections[i].pop()
+        candidates = [i for i, paras in enumerate(sections) if len(paras) > 2]
+        if not candidates:
+            return text, 0
+        longest = max(candidates, key=lambda i: sum(len(x) for x in sections[i]))
+        paras = sections[longest]
+        removed = 0
+        while len(paras) > 2 and removed < need:
+            removed += len(paras.pop()) + 2
+        for i in noted | {longest}:
+            sections[i].append(cls._SECTION_OMITTED)
+        new_text = cls.PREVIOUS_SECTIONS_SEP.join("\n\n".join(ps) for ps in sections)
+        return new_text, len(text) - len(new_text)
+
+    def _fit_context(self, messages: List[Dict[str, str]], trimmable: List[Dict[str, Any]],
+                     section_title: str) -> None:
+        """Shrink the prompt until it leaves SECTION_REPLY_TOKENS of the window free.
+
+        Run 12 sent two section prompts of ~8,040 tokens into the 8,192-token
+        window, and Run 13 three of 7,600-7,900 (with interview transcripts).
+        Ollama does not reject that: it shifts the context mid-reply, dropping
+        the start of the prompt (the system prompt with the quoting, framing
+        and overclaiming rules) while the section is still being written. A
+        chat already over the window before the reply is worse: Ollama drops
+        whole messages after the system prompt, the section task first
+        (Run 13 sections 3 and 4).
+
+        trimmable lists the prompt parts that can shrink: {"kind", "index"
+        (message), "text", "render" (text -> message content)}. The completed
+        sections go first (they are there only to avoid repetition), then the largest tool
+        result: its longest list (InsightForge's machine-extracted Key Facts),
+        then whole interviews. Verbatim agent posts are never trimmed.
+        """
+        budget = int((self.llm.num_ctx - self.SECTION_REPLY_TOKENS)
+                     * self._chars_per_token * self.CONTEXT_SAFETY)
+        size = sum(len(m["content"]) for m in messages)
+        trimmed = Counter()
+        while size > budget:
+            need = size - budget
+            order = [t for t in trimmable if t["kind"] == "previous"] + sorted(
+                (t for t in trimmable if t["kind"] == "tool"), key=lambda t: len(t["text"]), reverse=True)
+            for item in order:
+                shrinkers = [self._drop_paragraphs] if item["kind"] == "previous" \
+                    else [self._drop_list_items, self._drop_interviews]
+                for shrink in shrinkers:
+                    new_text, removed = shrink(item["text"], need)
+                    if removed > 0:
+                        break
+                if removed > 0:
+                    break
+            else:
+                logger.error(
+                    f"Section {section_title}: prompt is {size} chars, over the {budget}-char budget "
+                    f"({self.llm.num_ctx} tokens minus {self.SECTION_REPLY_TOKENS} for the reply), "
+                    "and nothing is left to trim"
+                )
+                return
+            item["text"] = new_text
+            old_len = len(messages[item["index"]]["content"])
+            messages[item["index"]]["content"] = item["render"](new_text)
+            size += len(messages[item["index"]]["content"]) - old_len
+            trimmed[item["kind"]] += old_len - len(messages[item["index"]]["content"])
+        if trimmed:
+            logger.info(f"Section {section_title}: trimmed {trimmed.get('previous', 0)} chars of completed "
+                        f"sections and {trimmed.get('tool', 0)} chars of tool results to fit "
+                        f"{self.llm.num_ctx} tokens ({size} chars at {self._chars_per_token:.2f} chars/token)")
+
+    def _section_llm_call(self, messages: List[Dict[str, str]], trimmable: List[Dict[str, Any]],
+                          section_title: str) -> str:
+        """One section-writing LLM call, fitted to the context window first."""
+        self._fit_context(messages, trimmable, section_title)
+        sent = sum(len(m["content"]) for m in messages)
+        result = self.llm.chat_result(
+            messages=messages,
+            temperature=0.5,
+            max_tokens=self.SECTION_REPLY_TOKENS,
+        )
+        if result.prompt_tokens:
+            measured = sent / result.prompt_tokens
+            if measured > self.DROPPED_MESSAGES_CHARS_PER_TOKEN:
+                logger.warning(f"Section {section_title}: {sent} chars counted as {result.prompt_tokens} tokens "
+                               f"({measured:.2f} chars/token); Ollama probably dropped earlier messages "
+                               f"to fit {self.llm.num_ctx} tokens")
+            self._chars_per_token = min(measured, self.MAX_CHARS_PER_TOKEN)
+            logger.info(f"Section {section_title}: prompt {result.prompt_tokens} tokens "
+                        f"({measured:.2f} chars/token), reply {result.completion_tokens} tokens")
+        if result.finish_reason == "length":
+            logger.warning(f"Section {section_title}: reply reached max_tokens={self.SECTION_REPLY_TOKENS} and was cut off")
+        return result.content
+
+    SUMMARY_CHARS_PER_SECTION = 3000
+
+    def _write_summary(self, outline: ReportOutline, sections: List[str]) -> str:
+        """One-sentence report summary, written after the sections from what they say.
+
+        Until Run 13 the planner wrote it before any tool call, from the
+        requirement and ten graph facts ("a surge in health anxiety, while
+        campaigners' warnings gain traction"), and every section writer was
+        given it as the report's findings. The planner now writes a scope
+        line; this replaces it.
+        """
+        body = "\n\n".join(sec[:self.SUMMARY_CHARS_PER_SECTION] for sec in sections)
+        prompt = f"""Simulation requirement:
+{self.simulation_requirement}
+
+{self._measured_counts}
+The report's sections:
+{body}
+
+Write the one sentence (at most 45 words) that opens this report, summarising what its sections found. Use only claims the sections make, keeping their hedges and counts. Do not add claims of spread, growth, polarisation or traction ("surge", "widespread", "gained traction") that no section supports with a count. Return only the sentence."""
+        try:
+            summary = self.llm.chat(
+                messages=[
+                    {"role": "system", "content": "You write report summaries. Respond in English only."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.3,
+                max_tokens=200,
+            ).strip().strip('"').strip()
+        except Exception as e:
+            logger.warning(f"Could not write the report summary; keeping the planned scope line: {e}")
+            return outline.summary
+        if not summary:
+            logger.warning("Report summary came back empty; keeping the planned scope line")
+            return outline.summary
+        logger.info(f"Report summary: {summary}")
+        return summary
+
     def _generate_section_react(
         self,
         section: ReportSection,
@@ -1281,6 +1779,7 @@ class ReportAgent:
             report_title=outline.title,
             report_summary=outline.summary,
             simulation_requirement=self.simulation_requirement,
+            measured_counts=self._measured_counts,
             section_title=section.title,
             tools_description=self._get_tools_description(),
         )
@@ -1292,19 +1791,22 @@ class ReportAgent:
                 # Each section limited to 4000 characters
                 truncated = sec[:4000] + "..." if len(sec) > 4000 else sec
                 previous_parts.append(truncated)
-            previous_content = "\n\n---\n\n".join(previous_parts)
+            previous_content = self.PREVIOUS_SECTIONS_SEP.join(previous_parts)
         else:
             previous_content = "(This is the first section)"
-        
-        user_prompt = SECTION_USER_PROMPT_TEMPLATE.format(
-            previous_content=previous_content,
-            section_title=section.title,
-        )
+
+        def render_user_prompt(previous: str) -> str:
+            return SECTION_USER_PROMPT_TEMPLATE.format(previous_content=previous, section_title=section.title)
 
         messages = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
+            {"role": "user", "content": render_user_prompt(previous_content)}
         ]
+        # Prompt parts _fit_context may shrink: completed sections, then tool results
+        trimmable: List[Dict[str, Any]] = []
+        if previous_sections:
+            trimmable.append({"kind": "previous", "index": 1, "text": previous_content,
+                              "render": render_user_prompt})
         
         # ReACT loop
         tool_calls_count = 0
@@ -1312,7 +1814,7 @@ class ReportAgent:
         min_tool_calls = 2  # Minimum tool calls required (reduced from 3 for reliability)
         conflict_retries = 0  # Consecutive conflict count when tool call and Final Answer appear together
         used_tools = set()  # Track which tools have been called
-        all_tools = {"insight_forge", "panorama_search", "quick_search", "interview_agents"}
+        all_tools = set(self.VALID_TOOL_NAMES)
 
         # Report context, used for InsightForge sub-question generation
         report_context = f"Section title: {section.title}\nSimulation requirement: {self.simulation_requirement}"
@@ -1326,11 +1828,7 @@ class ReportAgent:
                 )
             
             # Call LLM
-            response = self.llm.chat(
-                messages=messages,
-                temperature=0.5,
-                max_tokens=4096
-            )
+            response = self._section_llm_call(messages, trimmable, section.title)
 
             # Check if LLM returned None (API error or empty content)
             if response is None:
@@ -1479,17 +1977,21 @@ class ReportAgent:
                 if unused_tools and tool_calls_count < self.MAX_TOOL_CALLS_PER_SECTION:
                     unused_hint = REACT_UNUSED_TOOLS_HINT.format(unused_list=", ".join(unused_tools))
 
+                obs_kwargs = dict(
+                    tool_name=call["name"],
+                    tool_calls_count=tool_calls_count,
+                    max_tool_calls=self.MAX_TOOL_CALLS_PER_SECTION,
+                    used_tools_str=", ".join(used_tools),
+                    unused_hint=unused_hint,
+                )
                 messages.append({"role": "assistant", "content": response})
                 messages.append({
                     "role": "user",
-                    "content": REACT_OBSERVATION_TEMPLATE.format(
-                        tool_name=call["name"],
-                        result=result,
-                        tool_calls_count=tool_calls_count,
-                        max_tool_calls=self.MAX_TOOL_CALLS_PER_SECTION,
-                        used_tools_str=", ".join(used_tools),
-                        unused_hint=unused_hint,
-                    ),
+                    "content": REACT_OBSERVATION_TEMPLATE.format(result=result, **obs_kwargs),
+                })
+                trimmable.append({
+                    "kind": "tool", "index": len(messages) - 1, "text": result,
+                    "render": lambda r, kw=obs_kwargs: REACT_OBSERVATION_TEMPLATE.format(result=r, **kw),
                 })
                 continue
 
@@ -1529,11 +2031,7 @@ class ReportAgent:
         logger.warning(f"Section {section.title} reached max iterations, forcing generation")
         messages.append({"role": "user", "content": REACT_FORCE_FINAL_MSG})
         
-        response = self.llm.chat(
-            messages=messages,
-            temperature=0.5,
-            max_tokens=4096
-        )
+        response = self._section_llm_call(messages, trimmable, section.title)
 
         # Check if LLM returned None during forced conclusion
         if response is None:
@@ -1642,6 +2140,9 @@ class ReportAgent:
             if progress_callback:
                 progress_callback("planning", 0, "Starting report outline planning...")
             
+            # Measured before planning: the outline and every section use them
+            self._measured_counts = self._measure_requirement()
+
             outline = self.plan_outline(
                 progress_callback=lambda stage, prog, msg: 
                     progress_callback(stage, prog // 5, msg) if progress_callback else None
@@ -1687,6 +2188,8 @@ class ReportAgent:
                     )
                 
                 # Generate main section content
+                self._section_quotable = []
+                self._section_speakers = []
                 section_content = self._generate_section_react(
                     section=section,
                     outline=outline,
@@ -1700,6 +2203,17 @@ class ReportAgent:
                     section_index=section_num
                 )
                 
+                # Quotes must be agents' own words from this section's tools
+                section_content, qstats = self._verify_quotes(
+                    section_content, self._section_quotable, speakers=self._section_speakers,
+                )
+                logger.info(
+                    f"Section {section.title}: quotes kept={qstats['kept']}, "
+                    f"dropped={qstats['dropped']} (not verbatim agent text), "
+                    f"misattributed={qstats['misattributed']}, "
+                    f"inline_dropped={qstats['inline_dropped']} (sentences quoting words no agent wrote)"
+                )
+
                 section.content = section_content
                 generated_sections.append(f"## {section.title}\n\n{section_content}")
 
@@ -1728,6 +2242,10 @@ class ReportAgent:
                     completed_sections=completed_section_titles
                 )
             
+            # The summary opening the report is written from what the sections found
+            outline.summary = self._write_summary(outline, generated_sections)
+            ReportManager.save_outline(report_id, outline)
+
             # Phase 3: Assemble complete report
             if progress_callback:
                 progress_callback("generating", 95, "Assembling complete report...")
@@ -1819,7 +2337,11 @@ class ReportAgent:
             }
         """
         logger.info(f"Report Agent chat: {message[:50]}...")
-        
+
+        # Quotable text is per section/turn; left over from report generation
+        # it grows without bound and admits another section's sources
+        self._section_quotable = []
+        self._section_speakers = []
         chat_history = chat_history or []
         
         # Get generated report content
@@ -2174,52 +2696,10 @@ class ReportManager:
         # Remove ```tool_call...``` blocks
         content = re.sub(r'```tool_call.*?```', '', content, flags=re.DOTALL)
         # Remove lines that are just tool call JSON (common LLM leak pattern)
-        content = re.sub(r'^\s*\{"name":\s*"(insight_forge|panorama_search|quick_search|interview_agents)".*$', '', content, flags=re.MULTILINE)
+        content = re.sub(r'^\s*\{"name":\s*"(insight_forge|panorama_search|quick_search|interview_agents|simulation_stats)".*$', '', content, flags=re.MULTILINE)
         # Clean up excessive blank lines left behind
         content = re.sub(r'\n{3,}', '\n\n', content)
         return content.strip()
-
-    @classmethod
-    def _strip_hallucinated_platforms(cls, content: str, known_platforms: Optional[set] = None) -> str:
-        """
-        Remove sentences that reference social media platforms not present in the simulation.
-        The simulation only runs Twitter and Reddit environments. References to other platforms
-        (Facebook, Instagram, TikTok, YouTube, WhatsApp, Telegram, etc.) are hallucinated
-        unless they appeared in actual agent posts.
-        """
-        import re
-        if known_platforms is None:
-            known_platforms = {"twitter", "reddit", "x"}
-
-        HALLUCINATED_PLATFORMS = {
-            "facebook", "instagram", "tiktok", "tik tok", "youtube",
-            "whatsapp", "telegram", "snapchat", "linkedin", "pinterest",
-            "wechat", "weibo", "threads", "mastodon", "bluesky",
-        }
-
-        lines = content.split('\n')
-        cleaned_lines = []
-        for line in lines:
-            line_lower = line.lower()
-            # Check if line mentions a hallucinated platform
-            mentions_hallucinated = any(p in line_lower for p in HALLUCINATED_PLATFORMS)
-            if mentions_hallucinated:
-                # Only remove if it's making a claim about the platform being used in the simulation
-                # Keep lines that are just comparing or noting absence
-                claim_patterns = [
-                    r'(?:on|via|through|across|using)\s+(?:' + '|'.join(HALLUCINATED_PLATFORMS) + r')',
-                    r'(?:' + '|'.join(HALLUCINATED_PLATFORMS) + r')\s+(?:posts?|users?|groups?|pages?|stories|reels?|channels?|influencers?)',
-                ]
-                is_claim = any(re.search(pat, line_lower) for pat in claim_patterns)
-                if is_claim:
-                    logger.debug(f"Stripped hallucinated platform reference: {line[:80]}...")
-                    continue
-            cleaned_lines.append(line)
-
-        result = '\n'.join(cleaned_lines)
-        # Clean up excessive blank lines
-        result = re.sub(r'\n{3,}', '\n\n', result)
-        return result
 
     @classmethod
     def _clean_section_content(cls, content: str, section_title: str) -> str:
@@ -2245,27 +2725,34 @@ class ReportManager:
         # First: strip any leaked tool_call markup
         content = cls._strip_tool_call_markup(content)
 
-        # Strip hallucinated platform references
-        content = cls._strip_hallucinated_platforms(content)
-
         content = content.strip()
         lines = content.split('\n')
         cleaned_lines = []
         skip_next_empty = False
         
+        def same_title(text: str) -> bool:
+            norm = lambda t: re.sub(r'[^a-z0-9]', '', t.lower())
+            return norm(text) == norm(section_title)
+
         for i, line in enumerate(lines):
             stripped = line.strip()
-            
+
+            # The prompt asks for bold text instead of headings, so the LLM
+            # sometimes repeats the section title as a bold line (Run 8, section 4).
+            bold_match = re.match(r'^\*\*(.+?)\*\*:?$', stripped)
+            if i < 5 and bold_match and same_title(bold_match.group(1)):
+                skip_next_empty = True
+                continue
+
             # Check if this is a Markdown heading line
             heading_match = re.match(r'^(#{1,6})\s+(.+)$', stripped)
             
             if heading_match:
-                level = len(heading_match.group(1))
                 title_text = heading_match.group(2).strip()
                 
                 # Check if this heading duplicates the section title (skip duplicates within first 5 lines)
                 if i < 5:
-                    if title_text == section_title or title_text.replace(' ', '') == section_title.replace(' ', ''):
+                    if same_title(title_text):
                         skip_next_empty = True
                         continue
                 
@@ -2374,8 +2861,6 @@ class ReportManager:
 
         Assemble the full report from saved section files and perform heading cleanup
         """
-        folder = cls._get_report_folder(report_id)
-        
         # Build report header
         md_content = f"# {outline.title}\n\n"
         md_content += f"> {outline.summary}\n\n"

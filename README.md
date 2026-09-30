@@ -1,139 +1,91 @@
-<div align="center">
+# MiroFish-Offline+
 
-# MiroFish-Offline (Updated)
-
-**Fully local multi-agent simulation engine — no cloud APIs required.**
-
-*Simulate public opinion, market sentiment, and social dynamics entirely on your hardware.*
+**On-device multi-agent social simulation. No cloud APIs; runs on a 16 GB Mac.**
 
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue?style=flat-square)](./LICENSE)
 
-</div>
+## What this is
 
-## What is this?
+You give it a document describing a situation (a crisis, an announcement, a policy) and a question in plain English. It builds a cast of about 30 AI agents (residents, journalists, officials, organisations) and lets them react to the situation hour by hour on a simulated Twitter and Reddit. Then a report agent writes up what happened, using only what the agents actually posted.
 
-MiroFish is a multi-agent simulation engine: upload any document (press release, policy draft, financial report), and it generates AI agents with unique personalities that simulate the public reaction on social media. Posts, arguments, opinion shifts — hour by hour.
+It's a tool for exploring scenarios, not a forecast. Every model, database and embedding runs on your own machine: no API keys, no cloud.
 
-This fork makes it **fully local and fully English**, optimized for Apple Silicon (M2 Pro 16GB tested):
+It's an extended fork of [MiroFish-Offline](https://github.com/nikmcfly/MiroFish-Offline), which is itself a fork of [MiroFish](https://github.com/666ghj/MiroFish). The web app walks you through five steps:
 
-| Feature | Original MiroFish | This Fork |
-|---|---|---|
-| Language | Chinese UI | **English UI** (1,000+ strings translated) |
-| Graph DB | Zep Cloud | **Neo4j CE 5.18** |
-| LLM | DashScope / OpenAI API | **Ollama** (qwen3:8b) |
-| Embeddings | Zep Cloud | **nomic-embed-text** via Ollama |
-| Cloud dependency | API keys required | **Zero** |
-| Action routing | Every action = LLM call | **System One** (60-70% skip LLM) |
-| Agent behavior | Uniform | **4 archetypes** (Lurker, Amplifier, Contributor, Debater) |
-| Agent memory | Stateless | **Action journal** with SQLite persistence |
-| Model routing | Single model | **Tiered** (fast 0.6b for NER, 8b for generation) |
-| Response sharing | None | **Semantic pool** (embedding-matched cross-archetype reuse) |
-| KV cache | Default f16 | **Q8 quantized** (halves memory, negligible quality loss) |
+1. **Graph build.** The LLM designs an ontology for your document. Its entities and relationships are then extracted into a Neo4j knowledge graph.
+2. **Environment setup.** Agent personas are generated from the graph, along with a scenario clock and the dated events from your document.
+3. **Simulation.** Agents post, comment, like and repost on both platforms (via [OASIS](https://github.com/camel-ai/oasis)). Each round, every agent sees the time, the facts released so far and its own feed.
+4. **Report.** A report agent searches the graph, reads the agents' posts, interviews agents, and writes an analysis.
+5. **Interaction.** You can chat with the report agent or any individual agent, or send a survey to every agent.
 
-## How it works
-
-1. **Graph Build** — Extracts entities (people, companies, events) and relationships from your document. Builds a knowledge graph via Neo4j with chunked sampling for large documents.
-2. **Ontology Generation** — LLM designs entity types and relationship schemas from your source material (10 entity types, 6-10 relationship types).
-3. **Env Setup** — Generates agent personas with behavioral archetypes, speech profiles, emotional states, and weighted action distributions.
-4. **Simulation** — Agents interact on simulated Twitter/Reddit platforms. The **System One router** handles non-text actions (likes, follows, reposts) instantly without LLM calls. Only text-generating actions (posts, comments, quotes) use the LLM. The **response pool** reuses adapted posts between similar agents for further LLM savings.
-5. **Report** — A ReportAgent analyzes the post-simulation environment, interviews agents, searches the knowledge graph, and generates a structured analysis.
-6. **Interaction** — Chat with any agent from the simulated world. Full memory and personality persists.
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────┐
-│                  Flask API                       │
-│     graph.py   simulation.py   report.py        │
-└──────────────────┬──────────────────────────────┘
-                   │
-┌──────────────────▼──────────────────────────────┐
-│              Service Layer                       │
-│  EntityReader   GraphTools   OntologyGenerator   │
-│  ReportAgent    SimulationConfigGenerator        │
-└──────────────────┬──────────────────────────────┘
-                   │
-┌──────────────────▼──────────────────────────────┐
-│          Simulation Engine (OASIS)               │
-│  ┌─────────────────────────────────────┐        │
-│  │  System One Router                   │        │
-│  │  ┌───────────┐  ┌────────────────┐  │        │
-│  │  │ Archetype  │  │ Response Pool  │  │        │
-│  │  │ Weights    │  │ (text reuse)   │  │        │
-│  │  └─────┬─────┘  └───────┬────────┘  │        │
-│  │        │                │            │        │
-│  │   ManualAction     ManualAction      │        │
-│  │   (instant)        (semantic match)  │        │
-│  │        │                │            │        │
-│  │        └────────┬───────┘            │        │
-│  │                 │                    │        │
-│  │            LLMAction                 │        │
-│  │            (Ollama)                  │        │
-│  └─────────────────────────────────────┘        │
-│  Agent Memory Store (SQLite)                     │
-│  Tiered Model Router (0.6b→NER, 8b→generation)  │
-└──────────────────┬──────────────────────────────┘
-                   │
-            ┌──────▼──────┐
-            │  Neo4j CE   │
-            │  5.18       │
-            └─────────────┘
-```
-
-## Quick Start
+## Quick start (macOS)
 
 ### Prerequisites
 
-- Docker & Docker Compose (recommended), **or**
-- Python 3.11+, Node.js 18+, Neo4j 5.18+, Ollama
+- An Apple Silicon Mac with **16 GB RAM or more**.
+- [Docker Desktop](https://www.docker.com/products/docker-desktop/), for Neo4j.
+- [Ollama](https://ollama.com/download).
+- **Python 3.11.** Python 3.12 won't work, because OASIS and CAMEL require <3.12. Install it with `brew install python@3.11`.
+- **Node.js 18 or newer.** Install it with `brew install node`.
+- About 15 GB of free disk space for the models and the Python dependencies.
 
-### Option A: Docker
+### 1. Clone and configure
 
 ```bash
 git clone https://github.com/4uhn/MiroFish-Offline-Updated.git
 cd MiroFish-Offline-Updated
 cp .env.example .env
-
-docker compose up -d
-
-# Pull models into Ollama
-docker exec mirofish-ollama ollama pull qwen3:8b
-docker exec mirofish-ollama ollama pull nomic-embed-text
 ```
 
-Open `http://localhost:3000`.
+Open `.env` and set `NEO4J_PASSWORD` to a password of your choice. Leave everything else as it is. Each setting is explained in `.env.example`.
 
-### Option B: Manual (recommended for Apple Silicon)
-
-**1. Start Neo4j**
+### 2. Start Neo4j
 
 ```bash
-docker run -d --name neo4j \
-  -p 7474:7474 -p 7687:7687 \
-  -e NEO4J_AUTH=neo4j/mirofish123 \
-  neo4j:5.18-community
+docker compose up -d neo4j
 ```
 
-**2. Start Ollama & pull models**
+This starts Neo4j 5.18 on `localhost:7687`, using the password from `.env`.
+
+### 3. Start Ollama with the right settings
+
+> **Important:** the Ollama desktop app starts its own server in the background with default settings, and your settings below would then be silently ignored. Quit it first: use the llama icon in the menu bar, then **Quit Ollama**. Check with `pgrep -fl ollama`, which should print nothing.
+
+In a terminal that you keep open:
 
 ```bash
-ollama serve &
-ollama pull qwen3:8b           # LLM (best tool-calling stability)
-ollama pull nomic-embed-text   # Embeddings (768d)
+OLLAMA_CONTEXT_LENGTH=8192 \
+OLLAMA_NUM_PARALLEL=3 \
+OLLAMA_KV_CACHE_TYPE=q8_0 \
+OLLAMA_FLASH_ATTENTION=1 \
+OLLAMA_KEEP_ALIVE=-1 \
+ollama serve
 ```
 
-**3. Configure & run backend**
+In a second terminal, download the two models (about 5.5 GB):
 
 ```bash
-cp .env.example .env
-# Edit .env: set LLM_PROVIDER=ollama, LLM_MODEL_NAME=qwen3:8b
+ollama pull qwen3:8b
+ollama pull nomic-embed-text
+```
 
+Once a model has loaded, `ollama ps` should show a context of `8192`. If you change `OLLAMA_CONTEXT_LENGTH`, set `OLLAMA_NUM_CTX` in `.env` to the same value, because the backend sizes its prompts from it.
+
+### 4. Start the backend
+
+```bash
 cd backend
-pip install -r requirements.txt
+python3.11 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt   # first install is large (OASIS pulls in PyTorch)
 python run.py
 ```
 
-**4. Run frontend**
+The API listens on `http://127.0.0.1:5001`.
+
+### 5. Start the frontend
+
+In another terminal:
 
 ```bash
 cd frontend
@@ -141,118 +93,43 @@ npm install
 npm run dev
 ```
 
-Open `http://localhost:3000`.
+Open **http://localhost:3000**.
 
-## Configuration
+> `docker-compose.yml` also defines containers for the whole stack, but its Ollama service needs an NVIDIA GPU and Docker on macOS can't use the Mac's GPU. On a Mac, run Ollama natively as above.
 
-All settings in `.env` (copy from `.env.example`):
+## Try the example
 
-```bash
-# LLM provider: "ollama" or "groq"
-LLM_PROVIDER=ollama
-LLM_API_KEY=ollama
-LLM_BASE_URL=http://localhost:11434/v1
-LLM_MODEL_NAME=qwen3:8b
+`examples/bristol-water/` contains a ready-made scenario: the first week of a lead contamination crisis in Bristol's water supply. The scenario is **fictional**. It names real organisations, but none of the events happened.
 
-# Neo4j
-NEO4J_URI=bolt://localhost:7687
-NEO4J_USER=neo4j
-NEO4J_PASSWORD=mirofish123
+1. On the home page, upload `examples/bristol-water/seed.md` (PDF, Markdown and text files all work).
+2. Paste the contents of `examples/bristol-water/prompt.md` into the simulation requirement box, then click **Start Engine**.
+3. Follow the five steps. On a 16 GB M2 Pro, a full run takes about 40 minutes.
 
-# Embeddings
-EMBEDDING_MODEL=nomic-embed-text
-EMBEDDING_BASE_URL=http://localhost:11434
-```
+**Don't reload or close the page during the simulation step.** Reopening the page restarts the simulation from the beginning.
 
-**Optional: Tiered model routing** (speeds up graph building ~5x):
+## Design notes
 
-```bash
-ollama pull qwen3:0.6b
-# Then in .env:
-LLM_FAST_MODEL_NAME=qwen3:0.6b
-LLM_FAST_NUM_CTX=2048
-```
+- **Everything runs on one model: qwen3:8b.** A 16 GB machine fits one 8B model with three parallel 8K-token slots. A second model would mean a second set of behaviours to validate.
+- **Qwen3's hidden reasoning is turned off.** Qwen3 was silently "thinking" on every call. Turning it off cut an agent decision from 35.7 s to 3.0 s.
+- **Most actions don't use the LLM.** A dual-process "System One" router samples likes, reposts and do-nothing from each agent's behavioural archetype (lurker, amplifier, contributor or debater). Only posts and comments go to the LLM. In our test runs, about half of all agent decisions skipped the LLM.
+- **Agents amplify similar posts instead of copying them.** When an agent is about to write something close to a post from a similar agent, it reposts or upvotes that post instead of generating near-duplicate text. It never copies another agent's words.
+- **The scenario unfolds on a clock.** Dated events from the document are released at their simulated hour. Facts containing numbers that aren't in the document are dropped.
+- **Graph memory is grounded and scoped to the run.** A relationship extracted from agent activity is kept only if it is backed by what that agent actually did or wrote. Each run's graph edges are tagged with that run, so one run never leaks into another.
+- **The report can't invent numbers or quotes.** Counts (who said what, how often) are computed in code and handed to the model. Every quote is checked word for word against real agent posts and interview answers, and must be credited to the right speaker; a quote that fails is removed.
+- **Evidence comes before conclusions.** Report sections are framed as questions, and the summary is written last, from what the sections found.
+- **Code enforces integrity, not style.** Code checks only whether quotes are real, numbers are measured and prompts fit the context window. The model's wording isn't patched with extra rules: those patches kept growing and would be unnecessary with a larger model.
 
-Works with any OpenAI-compatible API — swap Ollama for any other provider by changing `LLM_BASE_URL` and `LLM_API_KEY`.
+## Limitations
 
-## LLM Call Reduction
+- **This is not a forecast.** Each scenario has been run once, with no variance across runs and no validation against real-world outcomes.
+- **An 8B model has a ceiling.** Reports can overclaim ("trust fluctuated", "gained traction") without the numbers to back it. Interview answers are sometimes presented as fact. One articulate agent can supply most of the quotes.
+- **Agents are similar.** They share templated openers, sometimes converge on the same view, and occasionally invent personal details or give wrong advice.
+- **Known issue: an event can be dropped.** The step that turns the document into a scenario can drop an event the question asks about; in the Bristol example it was the CEO's apology. No agent then sees that event, but the report may still describe reactions to it. The fix would be to check that every event named in the question is present in the scenario. It hasn't been made yet.
+- **Tested on one machine.** Development and testing used a single 16 GB M2 Pro MacBook Pro.
 
-The key optimization for local hardware. Three layers stack:
+## License and credits
 
-| Layer | What it does | Savings |
-|---|---|---|
-| **System One Router** | Non-text actions (like, follow, repost) resolved instantly via archetype-weighted sampling | ~60-70% of all decisions |
-| **Tiered Model Router** | NER/extraction tasks routed to qwen3:0.6b (~5x faster); text generation stays on qwen3:8b | ~5x faster graph building |
-| **Semantic Response Pool** | CREATE_POST reused cross-archetype via nomic-embed-text similarity matching, with text variation | ~30% of remaining text actions |
-| **Agent Memory** | Tracks all actions; replaces summary each round (no stacking) so agents stay contextually grounded | Better output quality |
+Licensed under the **GNU Affero General Public License v3.0** (see [LICENSE](./LICENSE)), the same license as the projects it builds on:
 
-Net result: **~75-80% of all agent decisions avoid LLM calls entirely.**
-
-### Behavioral Archetypes
-
-Each agent is assigned one of four archetypes that control their action distribution:
-
-| Archetype | Posts | Likes | Follows | Reposts | Does Nothing |
-|---|---|---|---|---|---|
-| **Lurker** | 3% | 15% | 5% | 2% | 75% |
-| **Amplifier** | 5% | 30% | 10% | 35% | 20% |
-| **Contributor** | 25% | 20% | 10% | 10% | 35% |
-| **Debater** | 30% | 10% | 5% | 15% | 40% |
-
-### Inference Optimization
-
-Additional optimizations for memory-constrained hardware (16GB):
-
-| Technique | Effect |
-|---|---|
-| **KV Cache Q8** (`OLLAMA_KV_CACHE_TYPE=q8_0`) | Halves KV cache memory with negligible quality loss |
-| **Context window 2048** (`OLLAMA_NUM_CTX=2048`) | Sufficient for social media posts, saves ~4x memory vs 8192 |
-| **Parallel requests 3** (`OLLAMA_NUM_PARALLEL=3`) | Balances throughput vs memory on 16GB |
-| **Keep alive** (`OLLAMA_KEEP_ALIVE=-1`) | Model stays loaded, avoids reload latency between rounds |
-
-## Hardware Requirements
-
-| Component | Minimum (qwen3:8b) | Recommended |
-|---|---|---|
-| RAM | 16 GB | 32 GB |
-| GPU/NPU | Apple M-series or 8GB VRAM | 16+ GB VRAM |
-| Disk | 15 GB | 30 GB |
-| CPU | 4 cores | 8+ cores |
-
-Tested on: M2 Pro 16GB (MacBook Pro). CPU-only mode works but is slower.
-
-## Tools
-
-```bash
-# Benchmark LLM throughput, embedding speed, pool efficiency
-python backend/scripts/benchmark.py
-python backend/scripts/benchmark.py --skip-embedding -o bench.json
-
-# Export a completed simulation as structured JSON
-python backend/scripts/export_simulation.py backend/uploads/simulations/<sim_id>
-python backend/scripts/export_simulation.py <sim_dir> --pretty --no-posts
-
-# Test LLM readiness before running a simulation
-python backend/scripts/test_llm_readiness.py
-```
-
-## Use Cases
-
-- **PR crisis testing** — simulate the public reaction to a press release before publishing
-- **Market sentiment** — feed financial news and observe simulated social response
-- **Policy impact analysis** — test draft regulations against simulated public opinion
-- **Research** — multi-agent behavior studies with configurable archetype distributions
-
-## License
-
-AGPL-3.0 — same as the original MiroFish project. See [LICENSE](./LICENSE).
-
-## Credits
-
-This project builds on the work of several open-source projects:
-
-- **[MiroFish](https://github.com/666ghj/MiroFish)** by [666ghj](https://github.com/666ghj) — the original multi-agent simulation engine
-- **[MiroFish-Offline](https://github.com/nikmcfly/MiroFish-Offline)** by [nikmcfly](https://github.com/nikmcfly) — the English fork with local-only stack that this project is based on
-- **[OASIS](https://github.com/camel-ai/oasis)** (CAMEL-AI) — the underlying simulation engine
-
-**This fork adds:** System One action routing (inspired by [TypeSafe/Jev](https://github.com/jevhub)), tiered model routing, behavioral archetypes, agent memory persistence, semantic response pooling (nomic-embed-text), benchmarking suite, simulation export, KV cache optimization, and inference tuning for Apple Silicon.
+- [**MiroFish**](https://github.com/666ghj/MiroFish) by 666ghj: the original multi-agent simulation and prediction engine.
+- [**MiroFish-Offline**](https://github.com/nikmcfly/MiroFish-Offline) by nikmcfly: the English, local-only fork (Neo4j and Ollama instead of cloud services) that this project extends.

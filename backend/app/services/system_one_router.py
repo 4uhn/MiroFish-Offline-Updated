@@ -12,7 +12,7 @@ QUOTE_POST) are forwarded to the LLM (System Two).
 
 import random
 import logging
-from typing import Dict, Any, List, Optional, Tuple, Union
+from typing import Dict, Any, List, Optional, Union
 
 from oasis import ActionType, LLMAction, ManualAction
 
@@ -235,4 +235,22 @@ def build_archetype_lookup(config: Dict[str, Any]) -> Dict[int, str]:
     for agent_cfg in config.get("agent_configs", []):
         agent_id = agent_cfg.get("agent_id", -1)
         lookup[agent_id] = agent_cfg.get("archetype", "contributor")
+    return lookup
+
+
+def build_voice_lookup(config: Dict[str, Any]) -> Dict[int, Optional[str]]:
+    """Build agent_id -> voice key used to gate response-pool reuse.
+
+    Synthetic personas share a voice when they come from the same template and
+    hold the same stance. Institutional agents speak only for themselves, so
+    their voice is None and they are excluded from pooling.
+    """
+    lookup: Dict[int, Optional[str]] = {}
+    for agent_cfg in config.get("agent_configs", []):
+        agent_id = agent_cfg.get("agent_id", -1)
+        entity_type = agent_cfg.get("entity_type", "") or ""
+        if entity_type.startswith("Synthetic_"):
+            lookup[agent_id] = f"{entity_type}|{agent_cfg.get('stance', 'neutral')}"
+        else:
+            lookup[agent_id] = None
     return lookup

@@ -6,6 +6,8 @@ export default defineConfig({
   plugins: [vue()],
   server: {
     port: 3000,
+    // Localhost only by default; the /api proxy has no auth. Docker sets VITE_HOST=0.0.0.0.
+    host: process.env.VITE_HOST || 'localhost',
     open: true,
     proxy: {
       '/api': {

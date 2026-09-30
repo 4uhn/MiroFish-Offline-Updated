@@ -1,4 +1,7 @@
-""""""
+"""
+Project Context Management
+Persists project state on server to avoid frontend passing large data between interfaces
+"""
 
 import os
 import json
@@ -7,11 +10,11 @@ import shutil
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 from enum import Enum
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from ..config import Config
 
 class ProjectStatus(str, Enum):
-    """"""
+    """Project status"""
     CREATED = "created"
     ONTOLOGY_GENERATED = "ontology_generated"
     GRAPH_BUILDING = "graph_building"
@@ -20,7 +23,7 @@ class ProjectStatus(str, Enum):
 
 @dataclass
 class Project:
-    """"""
+    """Project data model"""
     project_id: str
     name: str
     status: ProjectStatus
@@ -48,7 +51,7 @@ class Project:
     error: Optional[str] = None
     
     def to_dict(self) -> Dict[str, Any]:
-        """"""
+        """Convert to dictionary"""
         return {
             "project_id": self.project_id,
             "name": self.name,
@@ -69,7 +72,7 @@ class Project:
     
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'Project':
-        """"""
+        """Create from dictionary"""
         status = data.get('status', 'created')
         if isinstance(status, str):
             status = ProjectStatus(status)
@@ -93,39 +96,38 @@ class Project:
         )
 
 class ProjectManager:
-    """"""
+    """Project Manager - handles project persistence and retrieval"""
     
 
     PROJECTS_DIR = os.path.join(Config.UPLOAD_FOLDER, 'projects')
     
     @classmethod
     def _ensure_projects_dir(cls):
-        """"""
+        """Ensure project directory exists"""
         os.makedirs(cls.PROJECTS_DIR, exist_ok=True)
     
     @classmethod
     def _get_project_dir(cls, project_id: str) -> str:
-        """"""
+        """Get project directory path"""
         return os.path.join(cls.PROJECTS_DIR, project_id)
     
     @classmethod
     def _get_project_meta_path(cls, project_id: str) -> str:
-        """"""
+        """Get project metadata file path"""
         return os.path.join(cls._get_project_dir(project_id), 'project.json')
     
     @classmethod
     def _get_project_files_dir(cls, project_id: str) -> str:
-        """"""
+        """Get project file storage directory"""
         return os.path.join(cls._get_project_dir(project_id), 'files')
     
     @classmethod
     def _get_project_text_path(cls, project_id: str) -> str:
-        """"""
+        """Get project extracted text storage path"""
         return os.path.join(cls._get_project_dir(project_id), 'extracted_text.txt')
     
     @classmethod
     def create_project(cls, name: str = "Unnamed Project") -> Project:
-        """"""
         cls._ensure_projects_dir()
         
         project_id = f"proj_{uuid.uuid4().hex[:12]}"
@@ -152,7 +154,7 @@ class ProjectManager:
     
     @classmethod
     def save_project(cls, project: Project) -> None:
-        """"""
+        """Save project metadata"""
         project.updated_at = datetime.now().isoformat()
         meta_path = cls._get_project_meta_path(project.project_id)
         
@@ -161,7 +163,6 @@ class ProjectManager:
     
     @classmethod
     def get_project(cls, project_id: str) -> Optional[Project]:
-        """"""
         meta_path = cls._get_project_meta_path(project_id)
         
         if not os.path.exists(meta_path):
@@ -174,7 +175,6 @@ class ProjectManager:
     
     @classmethod
     def list_projects(cls, limit: int = 50) -> List[Project]:
-        """"""
         cls._ensure_projects_dir()
         
         projects = []
@@ -190,7 +190,6 @@ class ProjectManager:
     
     @classmethod
     def delete_project(cls, project_id: str) -> bool:
-        """"""
         project_dir = cls._get_project_dir(project_id)
         
         if not os.path.exists(project_dir):
@@ -201,7 +200,6 @@ class ProjectManager:
     
     @classmethod
     def save_file_to_project(cls, project_id: str, file_storage, original_filename: str) -> Dict[str, str]:
-        """"""
         files_dir = cls._get_project_files_dir(project_id)
         os.makedirs(files_dir, exist_ok=True)
         
@@ -225,14 +223,14 @@ class ProjectManager:
     
     @classmethod
     def save_extracted_text(cls, project_id: str, text: str) -> None:
-        """"""
+        """Save extracted text"""
         text_path = cls._get_project_text_path(project_id)
         with open(text_path, 'w', encoding='utf-8') as f:
             f.write(text)
     
     @classmethod
     def get_extracted_text(cls, project_id: str) -> Optional[str]:
-        """"""
+        """Get extracted text"""
         text_path = cls._get_project_text_path(project_id)
         
         if not os.path.exists(text_path):
@@ -241,17 +239,3 @@ class ProjectManager:
         with open(text_path, 'r', encoding='utf-8') as f:
             return f.read()
     
-    @classmethod
-    def get_project_files(cls, project_id: str) -> List[str]:
-        """"""
-        files_dir = cls._get_project_files_dir(project_id)
-        
-        if not os.path.exists(files_dir):
-            return []
-        
-        return [
-            os.path.join(files_dir, f) 
-            for f in os.listdir(files_dir) 
-            if os.path.isfile(os.path.join(files_dir, f))
-        ]
-

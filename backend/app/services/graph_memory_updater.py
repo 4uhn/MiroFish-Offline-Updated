@@ -8,13 +8,12 @@ Replaces zep_graph_memory_updater.py — Zep client replaced by GraphStorage.
 import os
 import time
 import threading
-import json
 from typing import Dict, Any, List, Optional, Callable
 from dataclasses import dataclass
 from datetime import datetime
 from queue import Queue, Empty
+from concurrent.futures import ThreadPoolExecutor
 
-from ..config import Config
 from ..utils.logger import get_logger
 from ..storage import GraphStorage
 
@@ -57,6 +56,32 @@ class AgentActivity:
         description = describe_func()
 
         return f"{self.agent_name}: {description}"
+
+    def grounding(self) -> Dict[str, Any]:
+        """What this activity lets the graph record about its agent.
+
+        own_words is the text the agent wrote; acted_on names the users whose
+        post, comment or account the agent acted on. Someone else's post
+        quoted inside the line is excluded: in Run 12 NER read Sophie Evans's
+        post inside "Ryan Thompson: reposted Sophie Evans's post" as Ryan
+        blaming the Environment Agency, which neither of them named.
+        """
+        args = self.action_args
+        own_words = {
+            "CREATE_POST": args.get("content", ""),
+            "CREATE_COMMENT": args.get("content", ""),
+            "QUOTE_POST": args.get("quote_content", "") or args.get("content", ""),
+        }.get(self.action_type, "")
+        acted_on = [
+            args.get(key, "")
+            for key in ("post_author_name", "original_author_name",
+                        "comment_author_name", "target_user_name")
+        ]
+        return {
+            "actor": self.agent_name,
+            "own_words": own_words,
+            "acted_on": [name for name in acted_on if name],
+        }
 
     def _describe_create_post(self) -> str:
         content = self.action_args.get("content", "")
@@ -192,17 +217,21 @@ class GraphMemoryUpdater:
     SEND_INTERVAL = 0.5
     MAX_RETRIES = 3
     RETRY_DELAY = 2
+    # Concurrent NER calls once the simulation has ended; match OLLAMA_NUM_PARALLEL.
+    DRAIN_WORKERS = int(os.environ.get('GRAPH_MEMORY_DRAIN_WORKERS', '3'))
 
-    def __init__(self, graph_id: str, storage: GraphStorage):
+    def __init__(self, graph_id: str, storage: GraphStorage, simulation_id: Optional[str] = None):
         """
         Initialize the updater.
 
         Args:
             graph_id: Graph ID
             storage: GraphStorage instance (injected)
+            simulation_id: Run the activities belong to; tagged on what they write
         """
         self.graph_id = graph_id
         self.storage = storage
+        self.simulation_id = simulation_id
 
         self._activity_queue: Queue = Queue()
 
@@ -215,10 +244,12 @@ class GraphMemoryUpdater:
         self._running = False
         self._worker_thread: Optional[threading.Thread] = None
 
+        self._stats_lock = threading.Lock()
         self._total_activities = 0
         self._total_sent = 0
         self._total_items_sent = 0
         self._failed_count = 0
+        self._failed_items = 0
         self._skipped_count = 0
 
         logger.info(f"GraphMemoryUpdater initialized: graph_id={graph_id}, batch_size={self.BATCH_SIZE}")
@@ -240,14 +271,23 @@ class GraphMemoryUpdater:
         self._worker_thread.start()
         logger.info(f"GraphMemoryUpdater started: graph_id={self.graph_id}")
 
-    def stop(self):
-        """Stop the background worker thread."""
+    def stop(self, timeout: Optional[float] = 10):
+        """Stop the worker after it has sent everything already queued.
+
+        The worker drains the queue and the partial platform buffers itself
+        (see _drain_remaining). Pass timeout=None to wait for the full drain;
+        with a timeout, a worker that is still busy finishes on its own thread.
+        """
         self._running = False
 
-        self._flush_remaining()
-
         if self._worker_thread and self._worker_thread.is_alive():
-            self._worker_thread.join(timeout=10)
+            self._worker_thread.join(timeout=timeout)
+        if self._worker_thread and self._worker_thread.is_alive():
+            logger.warning(
+                f"GraphMemoryUpdater still draining after {timeout}s: graph_id={self.graph_id}, "
+                f"pending={self.pending_count()}"
+            )
+            return
 
         logger.info(f"GraphMemoryUpdater stopped: graph_id={self.graph_id}, "
                      f"total_activities={self._total_activities}, "
@@ -256,14 +296,20 @@ class GraphMemoryUpdater:
                      f"failed={self._failed_count}, "
                      f"skipped={self._skipped_count}")
 
+    def pending_count(self) -> int:
+        """Activities not yet written to (or given up on for) the graph, including in-flight batches."""
+        with self._stats_lock:
+            return self._total_activities - self._total_items_sent - self._failed_items
+
     def add_activity(self, activity: AgentActivity):
         """Add an agent activity to the queue."""
         if activity.action_type == "DO_NOTHING":
             self._skipped_count += 1
             return
 
+        with self._stats_lock:
+            self._total_activities += 1
         self._activity_queue.put(activity)
-        self._total_activities += 1
         logger.debug(f"Added activity to queue: {activity.agent_name} - {activity.action_type}")
 
     def add_activity_from_dict(self, data: Dict[str, Any], platform: str):
@@ -284,30 +330,70 @@ class GraphMemoryUpdater:
         self.add_activity(activity)
 
     def _worker_loop(self):
-        """Background worker loop - sends activities to the graph in batches by platform."""
-        while self._running or not self._activity_queue.empty():
+        """Send full batches one at a time while the simulation runs, then drain the rest."""
+        while self._running:
             try:
                 try:
                     activity = self._activity_queue.get(timeout=1)
-
-                    platform = activity.platform.lower()
-                    with self._buffer_lock:
-                        if platform not in self._platform_buffers:
-                            self._platform_buffers[platform] = []
-                        self._platform_buffers[platform].append(activity)
-
-                        if len(self._platform_buffers[platform]) >= self.BATCH_SIZE:
-                            batch = self._platform_buffers[platform][:self.BATCH_SIZE]
-                            self._platform_buffers[platform] = self._platform_buffers[platform][self.BATCH_SIZE:]
-                            self._send_batch_activities(batch, platform)
-                            time.sleep(self.SEND_INTERVAL)
-
                 except Empty:
-                    pass
+                    continue
+
+                platform = activity.platform.lower()
+                batch = None
+                with self._buffer_lock:
+                    buffer = self._platform_buffers.setdefault(platform, [])
+                    buffer.append(activity)
+                    if len(buffer) >= self.BATCH_SIZE:
+                        batch = buffer[:self.BATCH_SIZE]
+                        del buffer[:self.BATCH_SIZE]
+
+                if batch:
+                    self._send_batch_activities(batch, platform)
+                    time.sleep(self.SEND_INTERVAL)
 
             except Exception as e:
                 logger.error(f"Worker loop exception: {e}")
                 time.sleep(1)
+
+        self._drain_remaining()
+
+    def _drain_remaining(self):
+        """Send everything still queued or buffered, DRAIN_WORKERS batches at a time.
+
+        While the simulation runs, one NER call at a time keeps the graph from
+        competing harder with the agents for Ollama. Once it has ended, Ollama
+        is otherwise idle, and a serial drain left 2 of its 3 slots unused
+        while the report waited (Run 9: ~25 batches, ~12 min). Neo4jStorage
+        serialises the graph writes, so only the NER calls overlap.
+        """
+        while True:
+            with self._buffer_lock:
+                while True:
+                    try:
+                        activity = self._activity_queue.get_nowait()
+                    except Empty:
+                        break
+                    self._platform_buffers.setdefault(activity.platform.lower(), []).append(activity)
+
+                batches = []
+                for platform, buffer in self._platform_buffers.items():
+                    for i in range(0, len(buffer), self.BATCH_SIZE):
+                        batches.append((buffer[i:i + self.BATCH_SIZE], platform))
+                    buffer.clear()
+
+            if not batches:
+                return
+
+            workers = max(1, min(self.DRAIN_WORKERS, len(batches)))
+            logger.info(
+                f"Draining {sum(len(b) for b, _ in batches)} activities in {len(batches)} batches "
+                f"with {workers} parallel NER calls: graph_id={self.graph_id}"
+            )
+            started = time.time()
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="GraphMemoryDrain") as pool:
+                for batch, platform in batches:
+                    pool.submit(self._send_batch_activities, batch, platform)
+            logger.info(f"Drained {len(batches)} batches in {time.time() - started:.0f}s: graph_id={self.graph_id}")
 
     def _send_batch_activities(self, activities: List[AgentActivity], platform: str):
         """
@@ -321,10 +407,15 @@ class GraphMemoryUpdater:
 
         for attempt in range(self.MAX_RETRIES):
             try:
-                self.storage.add_text(self.graph_id, combined_text)
+                self.storage.add_text(
+                    self.graph_id, combined_text, source="simulation",
+                    simulation_id=self.simulation_id,
+                    grounding=[activity.grounding() for activity in activities],
+                )
 
-                self._total_sent += 1
-                self._total_items_sent += len(activities)
+                with self._stats_lock:
+                    self._total_sent += 1
+                    self._total_items_sent += len(activities)
                 display_name = self._get_platform_display_name(platform)
                 logger.info(f"Successfully sent batch of {len(activities)} {display_name} activities to graph {self.graph_id}")
                 logger.debug(f"Batch content preview: {combined_text[:200]}...")
@@ -336,48 +427,9 @@ class GraphMemoryUpdater:
                     time.sleep(self.RETRY_DELAY * (attempt + 1))
                 else:
                     logger.error(f"Failed to send batch to graph after {self.MAX_RETRIES} retries: {e}")
-                    self._failed_count += 1
-
-    def _flush_remaining(self):
-        """Send remaining activities in the queue and buffers."""
-        while not self._activity_queue.empty():
-            try:
-                activity = self._activity_queue.get_nowait()
-                platform = activity.platform.lower()
-                with self._buffer_lock:
-                    if platform not in self._platform_buffers:
-                        self._platform_buffers[platform] = []
-                    self._platform_buffers[platform].append(activity)
-            except Empty:
-                break
-
-        with self._buffer_lock:
-            for platform, buffer in self._platform_buffers.items():
-                if buffer:
-                    display_name = self._get_platform_display_name(platform)
-                    logger.info(f"Sending {len(buffer)} remaining {display_name} activities")
-                    self._send_batch_activities(buffer, platform)
-            for platform in self._platform_buffers:
-                self._platform_buffers[platform] = []
-
-    def get_stats(self) -> Dict[str, Any]:
-        """Get statistics."""
-        with self._buffer_lock:
-            buffer_sizes = {p: len(b) for p, b in self._platform_buffers.items()}
-
-        return {
-            "graph_id": self.graph_id,
-            "batch_size": self.BATCH_SIZE,
-            "total_activities": self._total_activities,
-            "batches_sent": self._total_sent,
-            "items_sent": self._total_items_sent,
-            "failed_count": self._failed_count,
-            "skipped_count": self._skipped_count,
-            "queue_size": self._activity_queue.qsize(),
-            "buffer_sizes": buffer_sizes,
-            "running": self._running,
-        }
-
+                    with self._stats_lock:
+                        self._failed_count += 1
+                        self._failed_items += len(activities)
 
 class GraphMemoryManager:
     """
@@ -388,6 +440,7 @@ class GraphMemoryManager:
     """
 
     _updaters: Dict[str, GraphMemoryUpdater] = {}
+    _draining: Dict[str, GraphMemoryUpdater] = {}
     _lock = threading.Lock()
 
     @classmethod
@@ -406,7 +459,7 @@ class GraphMemoryManager:
             if simulation_id in cls._updaters:
                 cls._updaters[simulation_id].stop()
 
-            updater = GraphMemoryUpdater(graph_id, storage)
+            updater = GraphMemoryUpdater(graph_id, storage, simulation_id=simulation_id)
             updater.start()
             cls._updaters[simulation_id] = updater
 
@@ -419,13 +472,60 @@ class GraphMemoryManager:
         return cls._updaters.get(simulation_id)
 
     @classmethod
-    def stop_updater(cls, simulation_id: str):
-        """Stop and remove the updater for a simulation."""
+    def finish_updater(cls, simulation_id: str):
+        """Drain a finished simulation's updater on a background thread.
+
+        Called as soon as every platform has logged simulation_end. The OASIS
+        process stays alive afterwards to answer interviews, so waiting for
+        process exit (the old trigger) meant the last activities were never
+        written and the report read a partial graph.
+        """
         with cls._lock:
-            if simulation_id in cls._updaters:
-                cls._updaters[simulation_id].stop()
-                del cls._updaters[simulation_id]
-                logger.info(f"Stopped graph memory updater: simulation_id={simulation_id}")
+            updater = cls._updaters.pop(simulation_id, None)
+            if updater is None:
+                return
+            cls._draining[simulation_id] = updater
+        threading.Thread(
+            target=cls._drain, args=(simulation_id, updater), daemon=True,
+            name=f"GraphMemoryDrain-{simulation_id[-8:]}",
+        ).start()
+
+    @classmethod
+    def _drain(cls, simulation_id: str, updater: GraphMemoryUpdater):
+        try:
+            updater.stop(timeout=None)
+            logger.info(f"Graph memory drained: simulation_id={simulation_id}")
+        finally:
+            with cls._lock:
+                cls._draining.pop(simulation_id, None)
+
+    @classmethod
+    def pending_count(cls, simulation_id: str) -> int:
+        """Activities for this simulation not yet in the graph (0 when no updater exists)."""
+        updater = cls._updaters.get(simulation_id) or cls._draining.get(simulation_id)
+        return updater.pending_count() if updater else 0
+
+    @classmethod
+    def wait_until_drained(
+        cls,
+        simulation_id: str,
+        timeout: float,
+        on_wait: Optional[Callable[[int], None]] = None,
+        poll_interval: float = 5.0,
+    ) -> bool:
+        """Block until the simulation's activity has been written to the graph.
+
+        Returns True when nothing is pending, False on timeout. on_wait is
+        called with the pending count on each poll.
+        """
+        deadline = time.time() + timeout
+        while simulation_id in cls._updaters or simulation_id in cls._draining:
+            if time.time() >= deadline:
+                return False
+            if on_wait:
+                on_wait(cls.pending_count(simulation_id))
+            time.sleep(poll_interval)
+        return True
 
     _stop_all_done = False
 
@@ -445,11 +545,3 @@ class GraphMemoryManager:
                         logger.error(f"Failed to stop updater: simulation_id={simulation_id}, error={e}")
                 cls._updaters.clear()
             logger.info("Stopped all graph memory updaters")
-
-    @classmethod
-    def get_all_stats(cls) -> Dict[str, Dict[str, Any]]:
-        """Get statistics for all updaters."""
-        return {
-            sim_id: updater.get_stats()
-            for sim_id, updater in cls._updaters.items()
-        }

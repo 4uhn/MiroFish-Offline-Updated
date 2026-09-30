@@ -1,4 +1,7 @@
-""""""
+"""
+Task Status Management
+Tracks long-running tasks (like graph building)
+"""
 
 import uuid
 import threading
@@ -8,7 +11,7 @@ from typing import Dict, Any, Optional
 from dataclasses import dataclass, field
 
 class TaskStatus(str, Enum):
-    """"""
+    """Task status enumeration"""
     PENDING = "pending"
     PROCESSING = "processing"
     COMPLETED = "completed"
@@ -16,7 +19,7 @@ class TaskStatus(str, Enum):
 
 @dataclass
 class Task:
-    """"""
+    """Task data class"""
     task_id: str
     task_type: str
     status: TaskStatus
@@ -30,7 +33,7 @@ class Task:
     progress_detail: Dict = field(default_factory=dict)
     
     def to_dict(self) -> Dict[str, Any]:
-        """"""
+        """Convert to dictionary"""
         return {
             "task_id": self.task_id,
             "task_type": self.task_type,
@@ -46,13 +49,12 @@ class Task:
         }
 
 class TaskManager:
-    """"""
     
     _instance = None
     _lock = threading.Lock()
     
     def __new__(cls):
-        """"""
+        """Singleton pattern"""
         if cls._instance is None:
             with cls._lock:
                 if cls._instance is None:
@@ -62,7 +64,6 @@ class TaskManager:
         return cls._instance
     
     def create_task(self, task_type: str, metadata: Optional[Dict] = None) -> str:
-        """"""
         task_id = str(uuid.uuid4())
         now = datetime.now()
         
@@ -81,7 +82,7 @@ class TaskManager:
         return task_id
     
     def get_task(self, task_id: str) -> Optional[Task]:
-        """"""
+        """Get task"""
         with self._task_lock:
             return self._tasks.get(task_id)
     
@@ -95,7 +96,6 @@ class TaskManager:
         error: Optional[str] = None,
         progress_detail: Optional[Dict] = None
     ):
-        """"""
         with self._task_lock:
             task = self._tasks.get(task_id)
             if task:
@@ -114,42 +114,29 @@ class TaskManager:
                     task.progress_detail = progress_detail
     
     def complete_task(self, task_id: str, result: Dict):
-        """"""
+        """Mark task as completed"""
         self.update_task(
             task_id,
             status=TaskStatus.COMPLETED,
             progress=100,
-            message="",
+            message="Task completed",
             result=result
         )
     
     def fail_task(self, task_id: str, error: str):
-        """"""
+        """Mark task as failed"""
         self.update_task(
             task_id,
             status=TaskStatus.FAILED,
-            message="",
+            message="Task failed",
             error=error
         )
     
     def list_tasks(self, task_type: Optional[str] = None) -> list:
-        """"""
+        """List tasks"""
         with self._task_lock:
             tasks = list(self._tasks.values())
             if task_type:
                 tasks = [t for t in tasks if t.task_type == task_type]
             return [t.to_dict() for t in sorted(tasks, key=lambda x: x.created_at, reverse=True)]
     
-    def cleanup_old_tasks(self, max_age_hours: int = 24):
-        """"""
-        from datetime import timedelta
-        cutoff = datetime.now() - timedelta(hours=max_age_hours)
-        
-        with self._task_lock:
-            old_ids = [
-                tid for tid, task in self._tasks.items()
-                if task.created_at < cutoff and task.status in [TaskStatus.COMPLETED, TaskStatus.FAILED]
-            ]
-            for tid in old_ids:
-                del self._tasks[tid]
-

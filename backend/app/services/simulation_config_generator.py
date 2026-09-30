@@ -7,48 +7,29 @@ Fully automated with no manual parameter setup required.
 Uses a step-by-step generation strategy to avoid failures from generating
 overly long content in a single pass:
 1. Generate time configuration
-2. Generate event configuration
+2. Extract the scenario brief (start time, place, dated facts) from the document
 3. Generate Agent configurations in batches
-4. Generate platform configuration
+4. Generate event configuration, written for named agents from the roster
+5. Generate platform configuration
 """
 
 import json
 import math
 import os
+import re
 from typing import Dict, Any, List, Optional, Callable
 from dataclasses import dataclass, field, asdict
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from openai import OpenAI
 
 from ..config import Config
 from ..utils.logger import get_logger
+from ..utils.llm_client import ollama_extra_body
 from .entity_reader import EntityNode
+from .scenario import date_in_source, ground_fact, numbers_in_source, parse_datetime
 
 logger = get_logger('mirofish.simulation_config')
-
-# Default activity schedule configuration (UK timezone)
-DEFAULT_ACTIVITY_SCHEDULE = {
-    # Dead hours (almost no activity)
-    "dead_hours": [0, 1, 2, 3, 4, 5],
-    # Morning hours (gradually waking up)
-    "morning_hours": [6, 7, 8],
-    # Work hours
-    "work_hours": [9, 10, 11, 12, 13, 14, 15, 16, 17],
-    # Evening peak hours (most active)
-    "peak_hours": [18, 19, 20, 21],
-    # Night hours (activity declining)
-    "night_hours": [22, 23],
-    # Activity multipliers
-    "activity_multipliers": {
-        "dead": 0.05,      # Late night, almost no one active
-        "morning": 0.4,    # Morning, gradually increasing
-        "work": 0.7,       # Work hours, moderate activity
-        "peak": 1.5,       # Evening peak
-        "night": 0.5       # Late night, declining
-    }
-}
-
 
 @dataclass
 class AgentActivityConfig:
@@ -131,6 +112,10 @@ class EventConfig:
     # Narrative direction
     narrative_direction: str = ""
 
+    # Round count the scheduled events were planned against. The runner
+    # rescales trigger_round when the simulation runs for a different count.
+    planned_rounds: int = 0
+
 
 @dataclass
 class PlatformConfig:
@@ -167,6 +152,10 @@ class SimulationParameters:
     # Event configuration
     event_config: EventConfig = field(default_factory=EventConfig)
 
+    # Scenario brief: {"start", "location", "facts": [{"text", "known_from"}]},
+    # read by the runner's scenario clock and fact sheet (scenario.py)
+    scenario: Dict[str, Any] = field(default_factory=dict)
+
     # Platform configuration
     twitter_config: Optional[PlatformConfig] = None
     reddit_config: Optional[PlatformConfig] = None
@@ -190,6 +179,7 @@ class SimulationParameters:
             "time_config": time_dict,
             "agent_configs": [asdict(a) for a in self.agent_configs],
             "event_config": asdict(self.event_config),
+            "scenario": self.scenario,
             "twitter_config": asdict(self.twitter_config) if self.twitter_config else None,
             "reddit_config": asdict(self.reddit_config) if self.reddit_config else None,
             "llm_model": self.llm_model,
@@ -228,6 +218,11 @@ class SimulationConfigGenerator:
     ENTITY_SUMMARY_LENGTH = 300          # Entity summary
     AGENT_SUMMARY_LENGTH = 300           # Entity summary in Agent config
     ENTITIES_PER_TYPE_DISPLAY = 20       # Number of entities displayed per type
+
+    # Activity range for graph entities, which all post in the institutional
+    # voice. Run 10 gave "Local businesses" 0.9 and a chemical works 0.8, and
+    # 8 institutions wrote 59 of ~95 texts, drowning out the residents.
+    INSTITUTION_ACTIVITY = (0.1, 0.3)
     
     def __init__(
         self,
@@ -286,7 +281,7 @@ class SimulationConfigGenerator:
         num_entity_batches = math.ceil(len(entities) / self.AGENTS_PER_BATCH)
         num_synthetic_batches = math.ceil(len(synthetic_personas) / self.AGENTS_PER_BATCH) if synthetic_personas else 0
         num_batches = num_entity_batches + num_synthetic_batches
-        total_steps = 3 + num_batches  # Time config + Event config + N Agent batches + Platform config
+        total_steps = 4 + num_batches  # Time + scenario + N Agent batches + events + platform
         current_step = 0
         
         def report_progress(step: int, message: str):
@@ -307,20 +302,17 @@ class SimulationConfigGenerator:
         
         # ========== Step 1: Generate time configuration ==========
         report_progress(1, "Generating time configuration...")
-        num_entities = len(entities)
-        time_config_result = self._generate_time_config(context, num_entities)
-        time_config = self._parse_time_config(time_config_result, num_entities)
+        # Activity bounds are per agent in the simulation, synthetic personas included
+        time_config_result = self._generate_time_config(context, total_agents)
+        time_config = self._parse_time_config(time_config_result, total_agents)
         reasoning_parts.append(f"Time config: {time_config_result.get('reasoning', 'Success')}")
 
-        # ========== Step 2: Generate event configuration ==========
-        report_progress(2, "Generating event configuration and trending topics...")
-        # Use the actual max rounds the simulation will run (from env config)
-        actual_max_rounds = int(os.environ.get('OASIS_DEFAULT_MAX_ROUNDS', '10'))
-        computed_rounds = time_config.total_simulation_hours // max(1, time_config.minutes_per_round // 60)
-        total_rounds = min(computed_rounds, actual_max_rounds) if actual_max_rounds > 0 else computed_rounds
-        event_config_result = self._generate_event_config(context, simulation_requirement, entities, total_rounds)
-        event_config = self._parse_event_config(event_config_result)
-        reasoning_parts.append(f"Event config: {event_config_result.get('reasoning', 'Success')}")
+        # ========== Step 2: Scenario brief (start time, place, dated facts) ==========
+        report_progress(2, "Extracting scenario timeline and facts...")
+        scenario = self._generate_scenario(document_text, simulation_requirement, time_config)
+        reasoning_parts.append(
+            f"Scenario: start={scenario.get('start') or 'undated'}, {len(scenario.get('facts', []))} facts"
+        )
 
         # ========== Steps 3-N: Generate Agent configurations in batches ==========
         all_agent_configs = []
@@ -343,6 +335,7 @@ class SimulationConfigGenerator:
             all_agent_configs.extend(batch_configs)
 
         # Generate configs for synthetic individual personas
+        personas_by_agent: Dict[int, Dict[str, Any]] = {}
         if synthetic_personas:
             synthetic_start_idx = len(entities)
             for batch_idx in range(num_synthetic_batches):
@@ -363,15 +356,27 @@ class SimulationConfigGenerator:
                     simulation_requirement=simulation_requirement,
                 )
                 all_agent_configs.extend(batch_configs)
+                for i, persona in enumerate(batch_personas):
+                    personas_by_agent[agent_start_idx + i] = persona
 
         reasoning_parts.append(f"Agent config: successfully generated {len(all_agent_configs)}")
 
-        # ========== Assign publisher Agents to initial posts ==========
-        logger.info("Assigning suitable publisher Agents to initial posts...")
-        event_config = self._assign_initial_post_agents(event_config, all_agent_configs)
-        assigned_count = len([p for p in event_config.initial_posts if p.get("poster_agent_id") is not None])
-        scheduled_count = len([e for e in event_config.scheduled_events if e.get("poster_agent_id") is not None])
-        reasoning_parts.append(f"Post assignment: {assigned_count} initial + {scheduled_count} scheduled events assigned")
+        # ========== Events, written for named agents ==========
+        report_progress(3 + num_batches, "Generating initial posts and scheduled events...")
+        # Use the actual max rounds the simulation will run (from env config)
+        actual_max_rounds = int(os.environ.get('OASIS_DEFAULT_MAX_ROUNDS', '10'))
+        computed_rounds = time_config.total_simulation_hours // max(1, time_config.minutes_per_round // 60)
+        total_rounds = min(computed_rounds, actual_max_rounds) if actual_max_rounds > 0 else computed_rounds
+        roster = self._build_roster(all_agent_configs, personas_by_agent)
+        event_config_result = self._generate_event_config(
+            simulation_requirement, document_text, roster, scenario, time_config, total_rounds
+        )
+        event_config = self._parse_event_config(event_config_result, roster, document_text, scenario)
+        event_config.planned_rounds = total_rounds
+        reasoning_parts.append(
+            f"Event config: {len(event_config.initial_posts)} initial posts, "
+            f"{len(event_config.scheduled_events)} scheduled events"
+        )
 
         # ========== Final step: Generate platform configuration ==========
         report_progress(total_steps, "Generating platform configuration...")
@@ -407,6 +412,7 @@ class SimulationConfigGenerator:
             time_config=time_config,
             agent_configs=all_agent_configs,
             event_config=event_config,
+            scenario=scenario,
             twitter_config=twitter_config,
             reddit_config=reddit_config,
             llm_model=self.model_name,
@@ -473,7 +479,6 @@ class SimulationConfigGenerator:
     
     def _call_llm_with_retry(self, prompt: str, system_prompt: str) -> Dict[str, Any]:
         """LLM call with retry logic and JSON repair"""
-        import re
         
         max_attempts = 3
         last_error = None
@@ -487,6 +492,7 @@ class SimulationConfigGenerator:
                         {"role": "user", "content": prompt}
                     ],
                     response_format={"type": "json_object"},
+                    extra_body=ollama_extra_body(self.base_url),
                     temperature=0.7 - (attempt * 0.1)  # Lower temperature on each retry
                     # No max_tokens set, let LLM generate freely
                 )
@@ -577,8 +583,8 @@ class SimulationConfigGenerator:
         # Use configured context truncation length
         context_truncated = context[:self.TIME_CONFIG_CONTEXT_LENGTH]
 
-        # Calculate maximum allowed value (90% of agent count)
-        max_agents_allowed = max(1, int(num_entities * 0.9))
+        # Calculate maximum allowed value (90% of agent count, within the compute budget)
+        max_agents_allowed = min(max(1, int(num_entities * 0.9)), self._agents_per_hour_budget())
 
         prompt = f"""Based on the following simulation requirements, generate a time simulation configuration.
 
@@ -605,8 +611,8 @@ Example:
 {{
     "total_simulation_hours": 72,
     "minutes_per_round": 60,
-    "agents_per_hour_min": 5,
-    "agents_per_hour_max": 50,
+    "agents_per_hour_min": 3,
+    "agents_per_hour_max": {max_agents_allowed},
     "peak_hours": [18, 19, 20, 21],
     "off_peak_hours": [0, 1, 2, 3, 4, 5],
     "morning_hours": [6, 7, 8],
@@ -647,6 +653,16 @@ Field descriptions:
             "reasoning": "Using default activity pattern configuration (1 hour per round)"
         }
     
+    @staticmethod
+    def _agents_per_hour_budget() -> int:
+        """Most agents activated per simulated hour: a compute budget, not a realism setting.
+
+        Every active agent is one decision per round, and on a 16GB M2 Pro with
+        3 decode slots that sets the simulation's wall time. Raise
+        SIM_MAX_AGENTS_PER_HOUR on faster hardware.
+        """
+        return max(1, int(os.environ.get('SIM_MAX_AGENTS_PER_HOUR', '8')))
+
     def _parse_time_config(self, result: Dict[str, Any], num_entities: int) -> TimeSimulationConfig:
         """Parse time configuration result and validate agents_per_hour values do not exceed total agent count"""
         # Get raw values
@@ -661,6 +677,12 @@ Field descriptions:
         if agents_per_hour_max > num_entities:
             logger.warning(f"agents_per_hour_max ({agents_per_hour_max}) exceeds total Agent count ({num_entities}), corrected")
             agents_per_hour_max = max(agents_per_hour_min + 1, num_entities // 2)
+
+        budget = self._agents_per_hour_budget()
+        if agents_per_hour_max > budget:
+            logger.info(f"agents_per_hour_max {agents_per_hour_max} capped to SIM_MAX_AGENTS_PER_HOUR={budget}")
+            agents_per_hour_max = budget
+            agents_per_hour_min = min(agents_per_hour_min, budget)
 
         # Ensure min < max
         if agents_per_hour_min >= agents_per_hour_max:
@@ -682,199 +704,362 @@ Field descriptions:
             peak_activity_multiplier=1.5
         )
     
+    # Document characters given to the scenario extraction (qwen3:8b runs with an 8K context)
+    SCENARIO_DOC_LENGTH = 12000
+    MIN_FACTS = 8
+    MAX_FACTS = 14
+    MAX_INITIAL_POSTS = 6
+
+    def _generate_scenario(
+        self,
+        document_text: str,
+        simulation_requirement: str,
+        time_config: TimeSimulationConfig,
+    ) -> Dict[str, Any]:
+        """Extract the scenario brief: start time, place and dated facts.
+
+        Run 10 agents had no clock and no fact sheet, so qwen3:8b invented
+        dates, places and links. The brief gives the runner both (scenario.py).
+        Every fact is checked against the document (ground_fact) and every
+        date must appear in it (date_in_source); anything that fails is
+        dropped, not repaired. Without a document date the run is undated.
+        """
+        doc = (document_text or "")[:self.SCENARIO_DOC_LENGTH]
+        if not doc.strip():
+            logger.warning("No document text: the scenario is undated and has no facts")
+            return {"start": None, "location": "", "facts": []}
+
+        prompt = f"""Read the document and extract the situation a social media simulation starts from.
+
+## Document
+{doc}
+
+## Simulation requirement
+{simulation_requirement}
+
+## Task
+The simulation covers {time_config.total_simulation_hours} hours from its start. Return JSON (no markdown):
+{{
+    "start": "YYYY-MM-DD HH:MM",
+    "location": "place name",
+    "facts": [
+        {{"text": "One fact in one sentence.", "known_from": "YYYY-MM-DD HH:MM"}},
+        {{"text": "A fact public before the start.", "known_from": null}}
+    ]
+}}
+
+Fields:
+- start: the date and time of the first public announcement (a notice, alert or statement to the public), as the document dates it. Internal findings the public was not told about happen before the start. null if the document gives no calendar date.
+- location: the town or area, written exactly as in the document.
+- facts: {self.MIN_FACTS} to {self.MAX_FACTS} facts, each one sentence under 25 words.
+  - Copy names, numbers, places and dates exactly as the document writes them. Add nothing the document does not say.
+  - Cover what happened, who is affected, the official advice, where to get help, the cause, and each later development.
+  - known_from: when the fact became public, from the document's timeline. Use the time of day if the document gives one, otherwise 09:00. null if it was public before the start or the document does not say when."""
+
+        system_prompt = ("You extract facts from documents. Respond in English only. Return pure JSON. "
+                         "Never add a name, number, date or place that is not in the document.")
+        try:
+            result = self._call_llm_with_retry(prompt, system_prompt)
+        except Exception as e:
+            logger.warning(f"Scenario extraction failed: {e}; the scenario is undated and has no facts")
+            return {"start": None, "location": "", "facts": []}
+        return self._parse_scenario(result, document_text)
+
+    @staticmethod
+    def _parse_scenario(result: Dict[str, Any], document_text: str) -> Dict[str, Any]:
+        """Validate the extracted brief against the document."""
+        start = parse_datetime(result.get("start"))
+        if start is not None and not date_in_source(start, document_text):
+            logger.warning(f"Scenario start {result.get('start')!r} is not a date in the document; run is undated")
+            start = None
+
+        location = (result.get("location") or "").strip() if isinstance(result.get("location"), str) else ""
+        if location and location.lower() not in document_text.lower():
+            logger.warning(f"Scenario location {location!r} is not in the document; dropped")
+            location = ""
+
+        facts: List[Dict[str, Any]] = []
+        seen = set()
+        for f in result.get("facts") or []:
+            if not isinstance(f, dict):
+                continue
+            text = re.sub(r"\s+", " ", (f.get("text") or "")).strip() if isinstance(f.get("text"), str) else ""
+            if not text or text.lower() in seen:
+                continue
+            if not ground_fact(text, document_text):
+                logger.warning(f"Scenario fact dropped, a number or name is not in the document: {text!r}")
+                continue
+            raw_when = f.get("known_from")
+            when = parse_datetime(raw_when)
+            if raw_when and when is None:
+                logger.warning(f"Scenario fact dropped, unreadable known_from {raw_when!r}: {text!r}")
+                continue
+            if when is not None:
+                if start is None:
+                    logger.warning(f"Scenario fact dropped, dated fact in an undated run: {text!r}")
+                    continue
+                if not date_in_source(when, document_text):
+                    logger.warning(f"Scenario fact dropped, known_from {raw_when!r} is not a date in the document: {text!r}")
+                    continue
+                if when <= start:
+                    when = None  # public from the start
+            seen.add(text.lower())
+            facts.append({"text": text, "known_from": when.strftime("%Y-%m-%d %H:%M") if when else None})
+
+        if len(facts) > SimulationConfigGenerator.MAX_FACTS:
+            facts = facts[:SimulationConfigGenerator.MAX_FACTS]
+        if len(facts) < SimulationConfigGenerator.MIN_FACTS:
+            logger.warning(f"Scenario has only {len(facts)} grounded facts (wanted {SimulationConfigGenerator.MIN_FACTS}+)")
+        dated = sum(1 for f in facts if f["known_from"])
+        logger.info(f"Scenario: start={start or 'undated'}, location={location or '-'}, "
+                    f"{len(facts)} facts ({dated} revealed during the run)")
+        return {
+            "start": start.strftime("%Y-%m-%d %H:%M") if start else None,
+            "location": location,
+            "facts": facts,
+        }
+
+    @staticmethod
+    def _build_roster(
+        agent_configs: List[AgentActivityConfig],
+        personas_by_agent: Dict[int, Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Agents that can author a post, labelled for the event prompt.
+
+        Graph entities are institutions (the runner gives them the institutional
+        voice); synthetic personas are individuals.
+        """
+        roster = []
+        for a in agent_configs:
+            persona = personas_by_agent.get(a.agent_id)
+            if persona is None:
+                kind, detail = "institution", a.entity_type
+            else:
+                kind = "individual"
+                detail = persona.get("role") or a.entity_type.replace("Synthetic_", "").replace("_", " ")
+                if persona.get("age"):
+                    detail = f"{detail}, {persona['age']}"
+            roster.append({
+                "agent_id": a.agent_id,
+                "name": a.entity_name,
+                "entity_type": a.entity_type,
+                "kind": kind,
+                "role": (persona or {}).get("role", ""),
+                "label": f"{a.entity_name} ({kind}: {detail})",
+            })
+        return roster
+
     def _generate_event_config(
         self,
-        context: str,
         simulation_requirement: str,
-        entities: List[EntityNode],
-        total_rounds: int = 10
+        document_text: str,
+        roster: List[Dict[str, Any]],
+        scenario: Dict[str, Any],
+        time_config: TimeSimulationConfig,
+        total_rounds: int,
     ) -> Dict[str, Any]:
-        """Generate event configuration"""
+        """Generate seed posts and scheduled posts, each by a named roster agent.
 
-        # Get available entity types for LLM reference
-        entity_types_available = list(set(
-            e.get_entity_type() or "Unknown" for e in entities
-        ))
+        Run 10 asked for a poster_type and matched it to an agent afterwards:
+        a resident's "I have a child under five" went to Bristol Water and one
+        agent posted four of the nine seeds. Naming the poster in the prompt
+        lets the model write in that agent's voice. In a dated run each
+        scheduled event is a dated fact from the scenario, posted at its time.
+        """
+        start = parse_datetime(scenario.get("start"))
+        facts = scenario.get("facts") or []
+        known = [f["text"] for f in facts if not f.get("known_from")]
+        later = [f for f in facts if f.get("known_from")]
+        roster_lines = "\n".join(f"- {r['label']}" for r in roster)
 
-        # List representative entity names for each type
-        type_examples = {}
-        for e in entities:
-            etype = e.get_entity_type() or "Unknown"
-            if etype not in type_examples:
-                type_examples[etype] = []
-            if len(type_examples[etype]) < 3:
-                type_examples[etype].append(e.name)
+        if start is not None:
+            end = start + timedelta(hours=time_config.total_simulation_hours)
+            timeline = (
+                f"The simulation starts {start:%d %B %Y %H:%M} and ends {end:%d %B %Y %H:%M}.\n"
+                "Known at the start:\n" + "\n".join(f"- {t}" for t in known) +
+                "\nBecomes public later:\n" +
+                ("\n".join(f"- [{f['known_from']}] {f['text']}" for f in later) or "- (nothing)")
+            )
+            event_shape = ('{{"at": "YYYY-MM-DD HH:MM", "description": "Brief event description", '
+                           '"poster": "Name from the roster", "content": "Post text"}}').format()
+            event_rule = ("scheduled_events: one post for each development under \"Becomes public later\", "
+                          "with \"at\" set to its time. The poster is the organisation that announced it, "
+                          "or a journalist or resident reporting it.")
+        else:
+            timeline = "Known facts:\n" + "\n".join(f"- {f['text']}" for f in facts)
+            event_shape = ('{{"trigger_round": 1, "description": "Brief event description", '
+                           '"poster": "Name from the roster", "content": "Post text"}}').format()
+            event_rule = (f"scheduled_events: 3 to 6 later developments from the document, spread over rounds "
+                          f"1 to {total_rounds} in the order the document gives them.")
 
-        type_info = "\n".join([
-            f"- {t}: {', '.join(examples)}"
-            for t, examples in type_examples.items()
-        ])
-
-        # Use configured context truncation length
-        context_truncated = context[:self.EVENT_CONFIG_CONTEXT_LENGTH]
-
-        prompt = f"""Based on the following simulation requirements, generate an event configuration.
+        prompt = f"""Write the opening posts and the scheduled posts for a social media simulation.
 
 Simulation requirement: {simulation_requirement}
 
-{context_truncated}
+## Document
+{(document_text or "")[:self.EVENT_CONFIG_CONTEXT_LENGTH]}
 
-## Available Entity Types and Examples
-{type_info}
+## Timeline
+{timeline}
 
-## Simulation Structure
-The simulation will run for {total_rounds} rounds total. Use trigger_round to schedule events at specific rounds during the simulation to create a compelling narrative arc.
+## Roster (every poster must be one of these names, copied exactly)
+{roster_lines}
 
 ## Task
-Generate an event configuration JSON:
-- Extract trending topic keywords
-- Describe the narrative development direction
-- Design initial post content; **each post must specify a poster_type (publisher type)**
-- Design 3-6 scheduled events spread across the simulation rounds to drive narrative progression. Each event needs a trigger_round (1 to {total_rounds}) indicating when it fires. Space them out to create phases: early reaction, mid-simulation escalation, and late resolution/aftermath.
-
-**Important**: poster_type must be selected from the "Available Entity Types" listed above, so that initial posts can be assigned to the appropriate Agent for publishing.
-For example: official statements should be published by Official/University types, news by MediaOutlet, student opinions by Student.
-
-Return JSON format (no markdown):
+Return JSON (no markdown):
 {{
-    "hot_topics": ["keyword1", "keyword2", ...],
-    "narrative_direction": "<description of narrative development direction>",
+    "hot_topics": ["keyword1", "keyword2"],
+    "narrative_direction": "How the discussion is likely to develop",
     "initial_posts": [
-        {{"content": "Post content in English", "poster_type": "Entity type (must be from available types)"}},
-        ...
+        {{"poster": "Name from the roster", "content": "Post text"}}
     ],
     "scheduled_events": [
-        {{"trigger_round": 2, "description": "Brief event description", "poster_type": "Entity type", "content": "Post content triggered by this event"}},
-        {{"trigger_round": 5, "description": "Mid-simulation escalation", "poster_type": "Entity type", "content": "Post content for escalation"}},
-        {{"trigger_round": 8, "description": "Late resolution event", "poster_type": "Entity type", "content": "Post content for resolution"}}
+        {event_shape}
     ],
-    "reasoning": "<brief explanation>"
-}}"""
+    "reasoning": "Brief explanation"
+}}
 
-        system_prompt = "You are a public opinion analysis expert. Respond in English only. Return pure JSON format. Note that poster_type must exactly match an available entity type."
-        
+Rules:
+- initial_posts: 3 to {self.MAX_INITIAL_POSTS} posts at the start, from different posters: at least one institution and at least two individuals. Use only what is known at the start.
+- {event_rule}
+- An institution writes as "we" and states only facts it knows. An individual writes in the first person about their own situation.
+- Every number, date, place and name must come from the document. No links unless the document gives them.
+- Copy each poster's name exactly from the roster, without the part in brackets."""
+
+        system_prompt = ("You are a public opinion analysis expert. Respond in English only. Return pure JSON. "
+                         "Each poster must be a name from the roster.")
         try:
             return self._call_llm_with_retry(prompt, system_prompt)
         except Exception as e:
-            logger.warning(f"Event config LLM generation failed: {e}, using default config")
-            return {
-                "hot_topics": [],
-                "narrative_direction": "",
-                "initial_posts": [],
-                "reasoning": "Using default configuration"
-            }
-    
-    def _parse_event_config(self, result: Dict[str, Any]) -> EventConfig:
-        """Parse event configuration result"""
-        return EventConfig(
-            initial_posts=result.get("initial_posts", []),
-            scheduled_events=result.get("scheduled_events", []),
-            hot_topics=result.get("hot_topics", []),
-            narrative_direction=result.get("narrative_direction", "")
-        )
-    
-    def _match_agent_for_type(
+            logger.warning(f"Event config LLM generation failed: {e}; the simulation starts without seed posts")
+            return {"hot_topics": [], "narrative_direction": "", "initial_posts": [], "scheduled_events": []}
+
+    _FIRST_PERSON = re.compile(r"\b(?:I|I'm|I've|I'd|I'll)\b|\b(?:my|me|mine|myself)\b", re.IGNORECASE)
+    _CHILD_WORDS = re.compile(r"\b(?:child|children|kids?|son|daughter|baby|toddler)\b", re.IGNORECASE)
+    _URL = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
+
+    @classmethod
+    def _post_problem(cls, content: str, document_text: str) -> Optional[str]:
+        """Why a generated post cannot be used, or None."""
+        if not numbers_in_source(content, document_text):
+            return "a number is not in the document"
+        for url in cls._URL.findall(content):
+            if url.rstrip(".,)").lower() not in document_text.lower():
+                return f"link {url!r} is not in the document"
+        return None
+
+    def _parse_event_config(
         self,
-        poster_type: str,
-        agents_by_type: Dict[str, List[AgentActivityConfig]],
-        agent_configs: List[AgentActivityConfig],
-        used_indices: Dict[str, int]
-    ) -> int:
-        """Match an agent_id for a given poster_type using direct match, aliases, or fallback."""
-        type_aliases = {
-            "official": ["official", "university", "governmentagency", "government"],
-            "university": ["university", "official"],
-            "mediaoutlet": ["mediaoutlet", "media"],
-            "student": ["student", "person"],
-            "professor": ["professor", "expert", "teacher"],
-            "alumni": ["alumni", "person"],
-            "organization": ["organization", "ngo", "company", "group"],
-            "person": ["person", "student", "alumni"],
-        }
-
-        poster_type_lower = poster_type.lower()
-
-        # 1. Direct match
-        if poster_type_lower in agents_by_type:
-            agents = agents_by_type[poster_type_lower]
-            idx = used_indices.get(poster_type_lower, 0) % len(agents)
-            used_indices[poster_type_lower] = idx + 1
-            return agents[idx].agent_id
-
-        # 2. Match using aliases
-        for alias_key, aliases in type_aliases.items():
-            if poster_type_lower in aliases or alias_key == poster_type_lower:
-                for alias in aliases:
-                    if alias in agents_by_type:
-                        agents = agents_by_type[alias]
-                        idx = used_indices.get(alias, 0) % len(agents)
-                        used_indices[alias] = idx + 1
-                        return agents[idx].agent_id
-
-        # 3. Fallback: highest influence agent
-        logger.warning(f"No matching Agent found for type '{poster_type}', using highest influence Agent")
-        if agent_configs:
-            sorted_agents = sorted(agent_configs, key=lambda a: a.influence_weight, reverse=True)
-            return sorted_agents[0].agent_id
-        return 0
-
-    def _assign_initial_post_agents(
-        self,
-        event_config: EventConfig,
-        agent_configs: List[AgentActivityConfig]
+        result: Dict[str, Any],
+        roster: List[Dict[str, Any]],
+        document_text: str,
+        scenario: Dict[str, Any],
     ) -> EventConfig:
+        """Resolve each post's poster by name and drop posts that fail the checks.
+
+        A poster that is not on the roster is dropped, not matched to someone
+        similar. An institution given a first-person post ("my son") gets it
+        moved to an individual, preferring parents for posts about children.
         """
-        Assign suitable publisher Agents to initial posts and scheduled events.
+        by_name = {self._norm_name(r["name"]): r for r in roster}
+        individuals = [r for r in roster if r["kind"] == "individual"]
+        # Posts the model already gave each agent, so a moved post goes to
+        # someone without one of their own
+        usage: Dict[int, int] = {}
+        for post in (result.get("initial_posts") or []) + (result.get("scheduled_events") or []):
+            r = by_name.get(self._norm_name(str(post.get("poster") or ""))) if isinstance(post, dict) else None
+            if r:
+                usage[r["agent_id"]] = usage.get(r["agent_id"], 0) + 1
 
-        Match the most appropriate agent_id based on each post's poster_type.
-        """
-        # Build agent index by entity type
-        agents_by_type: Dict[str, List[AgentActivityConfig]] = {}
-        for agent in agent_configs:
-            etype = agent.entity_type.lower()
-            if etype not in agents_by_type:
-                agents_by_type[etype] = []
-            agents_by_type[etype].append(agent)
-
-        used_indices: Dict[str, int] = {}
-
-        # Assign agents to initial posts
-        if event_config.initial_posts:
-            updated_posts = []
-            for post in event_config.initial_posts:
-                poster_type = post.get("poster_type", "Unknown")
-                content = post.get("content", "")
-                matched_agent_id = self._match_agent_for_type(
-                    poster_type, agents_by_type, agent_configs, used_indices
+        def resolve(post: Dict[str, Any], what: str) -> Optional[Dict[str, Any]]:
+            content = (post.get("content") or "").strip() if isinstance(post.get("content"), str) else ""
+            if not content:
+                return None
+            name = str(post.get("poster") or "")
+            # The roster line itself ("Name (institution: Type)") is accepted;
+            # a name with its own brackets matches first.
+            author = (by_name.get(self._norm_name(name))
+                      or by_name.get(self._norm_name(re.sub(r"\s*\([^)]*\)\s*$", "", name))))
+            if author is None:
+                logger.warning(f"{what} dropped, poster {post.get('poster')!r} is not on the roster: {content[:60]!r}")
+                return None
+            problem = self._post_problem(content, document_text)
+            if problem:
+                logger.warning(f"{what} dropped, {problem}: {content[:80]!r}")
+                return None
+            if author["kind"] == "institution" and self._FIRST_PERSON.search(content):
+                if not individuals:
+                    logger.warning(f"{what} dropped, first-person post by institution {author['name']}: {content[:60]!r}")
+                    return None
+                wants_parent = bool(self._CHILD_WORDS.search(content))
+                candidates = sorted(
+                    individuals,
+                    key=lambda r: (not (wants_parent and "parent" in r["role"].lower()), usage.get(r["agent_id"], 0)),
                 )
-                updated_posts.append({
-                    "content": content,
-                    "poster_type": poster_type,
-                    "poster_agent_id": matched_agent_id
-                })
-                logger.info(f"Initial post assignment: poster_type='{poster_type}' -> agent_id={matched_agent_id}")
-            event_config.initial_posts = updated_posts
+                logger.info(f"{what}: first-person post moved from {author['name']} to {candidates[0]['name']}")
+                author = candidates[0]
+                usage[author["agent_id"]] = usage.get(author["agent_id"], 0) + 1
+            return {
+                "content": content,
+                "poster_name": author["name"],
+                "poster_type": author["entity_type"],
+                "poster_agent_id": author["agent_id"],
+            }
 
-        # Assign agents to scheduled events
-        if event_config.scheduled_events:
-            updated_events = []
-            for event in event_config.scheduled_events:
-                poster_type = event.get("poster_type", "Unknown")
-                matched_agent_id = self._match_agent_for_type(
-                    poster_type, agents_by_type, agent_configs, used_indices
-                )
-                updated_events.append({
-                    "trigger_round": event.get("trigger_round", 1),
-                    "description": event.get("description", ""),
-                    "content": event.get("content", ""),
-                    "poster_type": poster_type,
-                    "poster_agent_id": matched_agent_id
-                })
-                logger.info(f"Scheduled event assignment: round={event.get('trigger_round')}, poster_type='{poster_type}' -> agent_id={matched_agent_id}")
-            event_config.scheduled_events = updated_events
+        initial_posts = []
+        for post in result.get("initial_posts") or []:
+            if isinstance(post, dict) and (resolved := resolve(post, "Initial post")):
+                initial_posts.append(resolved)
+        if len(initial_posts) > self.MAX_INITIAL_POSTS:
+            logger.info(f"{len(initial_posts)} initial posts, keeping the first {self.MAX_INITIAL_POSTS}")
+            initial_posts = initial_posts[:self.MAX_INITIAL_POSTS]
+        kinds = {r["kind"] for r in roster if r["agent_id"] in {p["poster_agent_id"] for p in initial_posts}}
+        if kinds != {"institution", "individual"}:
+            logger.warning(f"Initial posts come only from: {sorted(kinds) or 'nobody'}")
 
-        return event_config
-    
+        start = parse_datetime(scenario.get("start"))
+        scheduled_events = []
+        for event in result.get("scheduled_events") or []:
+            if not isinstance(event, dict):
+                continue
+            desc = str(event.get("description") or "")
+            if start is not None:
+                when = parse_datetime(event.get("at"))
+                if when is None or not date_in_source(when, document_text):
+                    logger.warning(f"Scheduled event dropped, time {event.get('at')!r} is not a document date: {desc[:60]!r}")
+                    continue
+                if when <= start:
+                    logger.warning(f"Scheduled event dropped, {when} is not after the start {start}: {desc[:60]!r}")
+                    continue
+                timing = {"at": when.strftime("%Y-%m-%d %H:%M")}
+            else:
+                try:
+                    timing = {"trigger_round": max(1, int(event.get("trigger_round")))}
+                except (TypeError, ValueError):
+                    logger.warning(f"Scheduled event dropped, no trigger_round: {desc[:60]!r}")
+                    continue
+            resolved = resolve(event, "Scheduled event")
+            if resolved:
+                scheduled_events.append({**timing, "description": desc, **resolved})
+        scheduled_events.sort(key=lambda e: e.get("at") or e.get("trigger_round"))
+
+        for p in initial_posts:
+            logger.info(f"Initial post by {p['poster_name']} (agent {p['poster_agent_id']}): {p['content'][:60]!r}")
+        for e in scheduled_events:
+            logger.info(f"Scheduled event at {e.get('at') or 'round ' + str(e.get('trigger_round'))} "
+                        f"by {e['poster_name']} (agent {e['poster_agent_id']}): {e['content'][:60]!r}")
+
+        return EventConfig(
+            initial_posts=initial_posts,
+            scheduled_events=scheduled_events,
+            hot_topics=result.get("hot_topics") or [],
+            narrative_direction=result.get("narrative_direction") or "",
+        )
+
+    @staticmethod
+    def _norm_name(name: str) -> str:
+        return re.sub(r"\s+", " ", (name or "").strip().strip('"').lower())
+
     def _generate_agent_configs_batch(
         self,
         context: str,
@@ -907,10 +1092,11 @@ Simulation requirement: {simulation_requirement}
 ## Task
 Generate activity configurations for each entity, noting:
 - **Activity patterns should follow typical daily routines**: almost no activity from 0-5 AM, most active during evening 6-9 PM
-- **Official institutions** (University/GovernmentAgency): low activity (0.1-0.3), active during work hours (9-17), slow response (60-240 min), high influence (2.5-3.0)
-- **Media** (MediaOutlet): moderate activity (0.4-0.6), active all day (8-23), fast response (5-30 min), high influence (2.0-2.5)
-- **Individuals** (Student/Person/Alumni): high activity (0.6-0.9), mainly active in evenings (18-23), fast response (1-15 min), low influence (0.8-1.2)
-- **Public figures/experts**: moderate activity (0.4-0.6), medium-high influence (1.5-2.0)
+- These entities are organisations and officials; individual residents are simulated separately. Every activity_level must be 0.1-0.3.
+- **Official institutions** (University/GovernmentAgency): active during work hours (9-17), slow response (60-240 min), high influence (2.5-3.0)
+- **Media** (MediaOutlet): active all day (8-23), fast response (5-30 min), high influence (2.0-2.5)
+- **Businesses and community groups**: active during the day and early evening (8-20), moderate response (30-120 min), influence (1.0-1.5)
+- **Public figures/experts**: medium-high influence (1.5-2.0)
 
 Return JSON format (no markdown):
 {{
@@ -950,12 +1136,17 @@ Return JSON format (no markdown):
             if not cfg:
                 cfg = self._generate_agent_config_by_rule(entity)
             
+            activity_level = cfg.get("activity_level", 0.2)
+            clamped = min(max(float(activity_level), self.INSTITUTION_ACTIVITY[0]), self.INSTITUTION_ACTIVITY[1])
+            if clamped != activity_level:
+                logger.info(f"{entity.name}: activity_level {activity_level} clamped to {clamped}")
+
             config = AgentActivityConfig(
                 agent_id=agent_id,
                 entity_uuid=entity.uuid,
                 entity_name=entity.name,
                 entity_type=entity.get_entity_type() or "Unknown",
-                activity_level=cfg.get("activity_level", 0.5),
+                activity_level=clamped,
                 posts_per_hour=cfg.get("posts_per_hour", 0.5),
                 comments_per_hour=cfg.get("comments_per_hour", 1.0),
                 active_hours=cfg.get("active_hours", list(range(9, 23))),
