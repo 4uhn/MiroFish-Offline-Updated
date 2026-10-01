@@ -1,14 +1,14 @@
 # MiroFish-Offline+
 
-**On-device multi-agent social simulation. No cloud APIs; runs on a 16 GB Mac.**
+**On-device multi-agent social simulation, runs on my M2 Pro Mac.**
 
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue?style=flat-square)](./LICENSE)
 
 ## What this is
 
-You give it a document describing a situation (a crisis, an announcement, a policy) and a question in plain English. It builds a cast of about 30 AI agents (residents, journalists, officials, organisations) and lets them react to the situation hour by hour on a simulated Twitter and Reddit. Then a report agent writes up what happened, using only what the agents actually posted.
+You give it a document describing a situation (a crisis, an announcement, a policy) and a question in plain English. It builds a cast of about 30 AI agents (residents, journalists, officials, organisations) and lets them react to the situation hour by hour on a simulated Twitter and Reddit. A report agent then writes up what happened, using only what the agents actually posted.
 
-It's a tool for exploring scenarios, not a forecast. Every model, database and embedding runs on your own machine: no API keys, no cloud.
+It's a fun tool for exploring scenarios and do social predictions. Every model, database and embedding runs on your own machine: no API keys and no cloud needed.
 
 It's an extended fork of [MiroFish-Offline](https://github.com/nikmcfly/MiroFish-Offline), which is itself a fork of [MiroFish](https://github.com/666ghj/MiroFish). The web app walks you through five steps:
 
@@ -25,7 +25,7 @@ It's an extended fork of [MiroFish-Offline](https://github.com/nikmcfly/MiroFish
 - An Apple Silicon Mac with **16 GB RAM or more**.
 - [Docker Desktop](https://www.docker.com/products/docker-desktop/), for Neo4j.
 - [Ollama](https://ollama.com/download).
-- **Python 3.11.** Python 3.12 won't work, because OASIS and CAMEL require <3.12. Install it with `brew install python@3.11`.
+- [uv](https://docs.astral.sh/uv/), which manages the Python environment. Install it with `brew install uv`. The backend needs Python 3.11 (OASIS requires <3.12), and uv downloads 3.11 if you don't have it.
 - **Node.js 18 or newer.** Install it with `brew install node`.
 - About 15 GB of free disk space for the models and the Python dependencies.
 
@@ -75,10 +75,8 @@ Once a model has loaded, `ollama ps` should show a context of `8192`. If you cha
 
 ```bash
 cd backend
-python3.11 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt   # first install is large (OASIS pulls in PyTorch)
-python run.py
+uv sync               # first install is large (OASIS pulls in PyTorch)
+uv run python run.py
 ```
 
 The API listens on `http://127.0.0.1:5001`.
@@ -95,8 +93,6 @@ npm run dev
 
 Open **http://localhost:3000**.
 
-> `docker-compose.yml` also defines containers for the whole stack, but its Ollama service needs an NVIDIA GPU and Docker on macOS can't use the Mac's GPU. On a Mac, run Ollama natively as above.
-
 ## Try the example
 
 `examples/bristol-water/` contains a ready-made scenario: the first week of a lead contamination crisis in Bristol's water supply. The scenario is **fictional**. It names real organisations, but none of the events happened.
@@ -109,9 +105,9 @@ Open **http://localhost:3000**.
 
 ## Design notes
 
-- **Everything runs on one model: qwen3:8b.** A 16 GB machine fits one 8B model with three parallel 8K-token slots. A second model would mean a second set of behaviours to validate.
-- **Qwen3's hidden reasoning is turned off.** Qwen3 was silently "thinking" on every call. Turning it off cut an agent decision from 35.7 s to 3.0 s.
-- **Most actions don't use the LLM.** A dual-process "System One" router samples likes, reposts and do-nothing from each agent's behavioural archetype (lurker, amplifier, contributor or debater). Only posts and comments go to the LLM. In our test runs, about half of all agent decisions skipped the LLM.
+- **Everything runs on one model: qwen3:8b.** A 16 GB machine fits one 8B model with three parallel 8K-token slots.
+- **Qwen3's hidden reasoning is turned off.** Qwen3 was silently "thinking" on every call which isnt necessarily needed. Turning it off cut an agent decision from 35.7 s to 3.0 s.
+- **Most actions don't use the LLM.** A dual-process "System One" router samples likes, reposts and do-nothings from each agent's behavioural archetype (lurker, amplifier, contributor or debater). Only posts and comments go to the LLM. In our test runs, about half of all agent decisions skipped the LLM.
 - **Agents amplify similar posts instead of copying them.** When an agent is about to write something close to a post from a similar agent, it reposts or upvotes that post instead of generating near-duplicate text. It never copies another agent's words.
 - **The scenario unfolds on a clock.** Dated events from the document are released at their simulated hour. Facts containing numbers that aren't in the document are dropped.
 - **Graph memory is grounded and scoped to the run.** A relationship extracted from agent activity is kept only if it is backed by what that agent actually did or wrote. Each run's graph edges are tagged with that run, so one run never leaks into another.
@@ -121,10 +117,9 @@ Open **http://localhost:3000**.
 
 ## Limitations
 
-- **This is not a forecast.** Each scenario has been run once, with no variance across runs and no validation against real-world outcomes.
+- **This is most definitely not a 100% accurate forecast.** Each scenario has been run once, with no variance across runs and no validation against real-world outcomes.
 - **An 8B model has a ceiling.** Reports can overclaim ("trust fluctuated", "gained traction") without the numbers to back it. Interview answers are sometimes presented as fact. One articulate agent can supply most of the quotes.
 - **Agents are similar.** They share templated openers, sometimes converge on the same view, and occasionally invent personal details or give wrong advice.
-- **Known issue: an event can be dropped.** The step that turns the document into a scenario can drop an event the question asks about; in the Bristol example it was the CEO's apology. No agent then sees that event, but the report may still describe reactions to it. The fix would be to check that every event named in the question is present in the scenario. It hasn't been made yet.
 - **Tested on one machine.** Development and testing used a single 16 GB M2 Pro MacBook Pro.
 
 ## License and credits

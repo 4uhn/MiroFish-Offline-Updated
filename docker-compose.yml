@@ -1,24 +1,4 @@
 services:
-  mirofish:
-    build: .
-    container_name: mirofish-offline
-    env_file:
-      - .env
-    environment:
-      - FLASK_HOST=0.0.0.0
-      - VITE_HOST=0.0.0.0
-    ports:
-      - "127.0.0.1:3000:3000"
-      - "127.0.0.1:5001:5001"
-    restart: unless-stopped
-    volumes:
-      - ./backend/uploads:/app/backend/uploads
-    depends_on:
-      neo4j:
-        condition: service_healthy
-      ollama:
-        condition: service_started
-
   neo4j:
     image: neo4j:5.18-community
     container_name: mirofish-neo4j
@@ -41,30 +21,6 @@ services:
       retries: 10
       start_period: 30s
 
-  ollama:
-    image: ollama/ollama:latest
-    container_name: mirofish-ollama
-    ports:
-      - "127.0.0.1:11434:11434"
-    # The backend budgets for an 8192-token window (OLLAMA_NUM_CTX) and 3 parallel slots
-    environment:
-      - OLLAMA_CONTEXT_LENGTH=8192
-      - OLLAMA_NUM_PARALLEL=3
-      - OLLAMA_KV_CACHE_TYPE=q8_0
-      - OLLAMA_FLASH_ATTENTION=1
-      - OLLAMA_KEEP_ALIVE=-1
-    volumes:
-      - ollama_data:/root/.ollama
-    restart: unless-stopped
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-
 volumes:
   neo4j_data:
   neo4j_logs:
-  ollama_data:
